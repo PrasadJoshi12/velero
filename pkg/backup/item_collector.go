@@ -346,7 +346,15 @@ func getOrderedResourcesForType(
 	if !ok || len(orderStr) == 0 {
 		return nil
 	}
-	orders := strings.Split(orderStr, ",")
+	parts := strings.Split(orderStr, ",")
+	orders := make([]string, 0, len(parts))
+	for _, part := range parts {
+		name := strings.TrimSpace(part)
+		if name == "" {
+			continue
+		}
+		orders = append(orders, name)
+	}
 	return orders
 }
 
@@ -508,7 +516,8 @@ func (r *itemCollector) getResourceItems(
 				kind:          resource.Kind,
 			})
 
-			if item.GetNamespace() != "" {
+			if item.GetNamespace() != "" &&
+				r.backupRequest.NamespaceIncludesExcludes.ShouldInclude(item.GetNamespace()) {
 				log.Debugf("Track namespace %s in nsTracker", item.GetNamespace())
 				r.nsTracker.track(item.GetNamespace())
 			}

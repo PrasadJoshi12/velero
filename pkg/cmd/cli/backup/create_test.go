@@ -129,30 +129,34 @@ func TestCreateOptions_ValidateBackupType(t *testing.T) {
 		o.BackupType = ""
 		err := o.validateBackupType()
 		require.NoError(t, err)
+		require.Empty(t, o.BackupType)
 
 		o.BackupType = "Incremental"
 		err = o.validateBackupType()
 		require.NoError(t, err)
+		require.EqualValues(t, velerov1api.BackupTypeIncremental, o.BackupType)
 
 		o.BackupType = "Full"
 		err = o.validateBackupType()
 		require.NoError(t, err)
+		require.EqualValues(t, velerov1api.BackupTypeFull, o.BackupType)
 
 		o.BackupType = " Incremental "
 		err = o.validateBackupType()
 		require.NoError(t, err)
+		require.EqualValues(t, velerov1api.BackupTypeIncremental, o.BackupType)
+
+		o.BackupType = "iNcReMeNtAl"
+		err = o.validateBackupType()
+		require.NoError(t, err)
+		require.EqualValues(t, velerov1api.BackupTypeIncremental, o.BackupType)
 	})
 
 	t.Run("invalid backup type", func(t *testing.T) {
 		o := NewCreateOptions()
 
-		o.BackupType = "incremental"
-		err := o.validateBackupType()
-		require.Error(t, err)
-		require.Equal(t, "invalid backup type incremental - valid values are 'Incremental', and 'Full'", err.Error())
-
 		o.BackupType = "invalid"
-		err = o.validateBackupType()
+		err := o.validateBackupType()
 		require.Error(t, err)
 		require.Equal(t, "invalid backup type invalid - valid values are 'Incremental', and 'Full'", err.Error())
 	})
@@ -230,6 +234,14 @@ func TestCreateOptions_OrderedResources(t *testing.T) {
 		"persistentvolumes": "pv1,pv2",
 	}
 	assert.Equal(t, expectedMixedResources, orderedResources)
+
+	// Spaces after commas in the resource list must be trimmed.
+	orderedResources, err = ParseOrderedResources("pods=ns1/p1, ns1/p2 ; persistentvolumeclaims= ns2/pvc1,  ns2/pvc2")
+	require.NoError(t, err)
+	assert.Equal(t, map[string]string{
+		"pods":                   "ns1/p1,ns1/p2",
+		"persistentvolumeclaims": "ns2/pvc1,ns2/pvc2",
+	}, orderedResources)
 }
 
 func TestCreateCommand(t *testing.T) {

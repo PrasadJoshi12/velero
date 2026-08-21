@@ -2931,7 +2931,6 @@ func (*fakeVolumeSnapshotter) DeleteSnapshot(snapshotID string) error {
 // looking at the backup request's VolumeSnapshots field. This test uses the fakeVolumeSnapshotter
 // struct in place of real volume snapshotters.
 func TestBackupWithSnapshots(t *testing.T) {
-	// TODO: add more verification for skippedPVTracker
 	itemBlockPool := StartItemBlockWorkerPool(t.Context(), 1, logrus.StandardLogger())
 	defer itemBlockPool.Stop()
 	tests := []struct {
@@ -2941,6 +2940,7 @@ func TestBackupWithSnapshots(t *testing.T) {
 		apiResources      []*test.APIResource
 		snapshotterGetter volumeSnapshotterGetter
 		want              []*volume.Snapshot
+		wantSkippedPVs    []SkippedPV
 	}{
 		{
 			name: "persistent volume with no zone annotation creates a snapshot",
@@ -2977,6 +2977,7 @@ func TestBackupWithSnapshots(t *testing.T) {
 					},
 				},
 			},
+			wantSkippedPVs: []SkippedPV{},
 		},
 		{
 			name: "persistent volume with deprecated zone annotation creates a snapshot",
@@ -2991,7 +2992,7 @@ func TestBackupWithSnapshots(t *testing.T) {
 			},
 			apiResources: []*test.APIResource{
 				test.PVs(
-					builder.ForPersistentVolume("pv-1").ObjectMeta(builder.WithLabels("failure-domain.beta.kubernetes.io/zone", "zone-1")).Result(),
+					builder.ForPersistentVolume("pv-1").ObjectMeta(builder.WithLabels(corev1api.LabelFailureDomainBetaZone, "zone-1")).Result(),
 				),
 			},
 			snapshotterGetter: map[string]vsv1.VolumeSnapshotter{
@@ -3014,6 +3015,7 @@ func TestBackupWithSnapshots(t *testing.T) {
 					},
 				},
 			},
+			wantSkippedPVs: []SkippedPV{},
 		},
 		{
 			name: "persistent volume with GA zone annotation creates a snapshot",
@@ -3028,7 +3030,7 @@ func TestBackupWithSnapshots(t *testing.T) {
 			},
 			apiResources: []*test.APIResource{
 				test.PVs(
-					builder.ForPersistentVolume("pv-1").ObjectMeta(builder.WithLabels("topology.kubernetes.io/zone", "zone-1")).Result(),
+					builder.ForPersistentVolume("pv-1").ObjectMeta(builder.WithLabels(corev1api.LabelTopologyZone, "zone-1")).Result(),
 				),
 			},
 			snapshotterGetter: map[string]vsv1.VolumeSnapshotter{
@@ -3051,6 +3053,7 @@ func TestBackupWithSnapshots(t *testing.T) {
 					},
 				},
 			},
+			wantSkippedPVs: []SkippedPV{},
 		},
 		{
 			name: "persistent volume with both GA and deprecated zone annotation creates a snapshot and should use the GA",
@@ -3065,7 +3068,7 @@ func TestBackupWithSnapshots(t *testing.T) {
 			},
 			apiResources: []*test.APIResource{
 				test.PVs(
-					builder.ForPersistentVolume("pv-1").ObjectMeta(builder.WithLabelsMap(map[string]string{"failure-domain.beta.kubernetes.io/zone": "zone-1-deprecated", "topology.kubernetes.io/zone": "zone-1-ga"})).Result(),
+					builder.ForPersistentVolume("pv-1").ObjectMeta(builder.WithLabelsMap(map[string]string{corev1api.LabelFailureDomainBetaZone: "zone-1-deprecated", corev1api.LabelTopologyZone: "zone-1-ga"})).Result(),
 				),
 			},
 			snapshotterGetter: map[string]vsv1.VolumeSnapshotter{
@@ -3088,6 +3091,7 @@ func TestBackupWithSnapshots(t *testing.T) {
 					},
 				},
 			},
+			wantSkippedPVs: []SkippedPV{},
 		},
 		{
 			name: "error returned from CreateSnapshot results in a failed snapshot",
@@ -3123,6 +3127,7 @@ func TestBackupWithSnapshots(t *testing.T) {
 					},
 				},
 			},
+			wantSkippedPVs: []SkippedPV{},
 		},
 		{
 			name: "backup with SnapshotVolumes=false does not create any snapshots",
@@ -3144,6 +3149,17 @@ func TestBackupWithSnapshots(t *testing.T) {
 				"default": new(fakeVolumeSnapshotter).WithVolume("pv-1", "vol-1", "", "type-1", 100, false),
 			},
 			want: nil,
+			wantSkippedPVs: []SkippedPV{
+				{
+					Name: "pv-1",
+					Reasons: []PVSkipReason{
+						{
+							Approach: volumeSnapshotApproach,
+							Reason:   "not satisfy the criteria for VolumePolicy or the legacy snapshot way",
+						},
+					},
+				},
+			},
 		},
 		{
 			name: "backup with no volume snapshot locations does not create any snapshots",
@@ -3162,6 +3178,17 @@ func TestBackupWithSnapshots(t *testing.T) {
 				"default": new(fakeVolumeSnapshotter).WithVolume("pv-1", "vol-1", "", "type-1", 100, false),
 			},
 			want: nil,
+			wantSkippedPVs: []SkippedPV{
+				{
+					Name: "pv-1",
+					Reasons: []PVSkipReason{
+						{
+							Approach: volumeSnapshotApproach,
+							Reason:   "no applicable volumesnapshotter found",
+						},
+					},
+				},
+			},
 		},
 		{
 			name: "backup with no volume snapshotters does not create any snapshots",
@@ -3181,6 +3208,17 @@ func TestBackupWithSnapshots(t *testing.T) {
 			},
 			snapshotterGetter: map[string]vsv1.VolumeSnapshotter{},
 			want:              nil,
+			wantSkippedPVs: []SkippedPV{
+				{
+					Name: "pv-1",
+					Reasons: []PVSkipReason{
+						{
+							Approach: volumeSnapshotApproach,
+							Reason:   "no applicable volumesnapshotter found",
+						},
+					},
+				},
+			},
 		},
 		{
 			name: "unsupported persistent volume type does not create any snapshots",
@@ -3202,6 +3240,17 @@ func TestBackupWithSnapshots(t *testing.T) {
 				"default": new(fakeVolumeSnapshotter),
 			},
 			want: nil,
+			wantSkippedPVs: []SkippedPV{
+				{
+					Name: "pv-1",
+					Reasons: []PVSkipReason{
+						{
+							Approach: volumeSnapshotApproach,
+							Reason:   "no applicable volumesnapshotter found",
+						},
+					},
+				},
+			},
 		},
 		{
 			name: "when there are multiple volumes, snapshot locations, and snapshotters, volumes are matched to the right snapshotters",
@@ -3255,6 +3304,7 @@ func TestBackupWithSnapshots(t *testing.T) {
 					},
 				},
 			},
+			wantSkippedPVs: []SkippedPV{},
 		},
 	}
 
@@ -3273,6 +3323,7 @@ func TestBackupWithSnapshots(t *testing.T) {
 			require.NoError(t, err)
 
 			assert.Equal(t, tc.want, tc.req.VolumeSnapshots.Get())
+			assert.Equal(t, tc.wantSkippedPVs, tc.req.SkippedPVTracker.Summary())
 		})
 	}
 }
@@ -5430,6 +5481,29 @@ func TestBackupNamespaces(t *testing.T) {
 			},
 		},
 		{
+			name:   "Wildcard star with excluded namespaces test",
+			backup: defaultBackup().IncludedNamespaces("*").ExcludedNamespaces("ns-2").Result(),
+			apiResources: []*test.APIResource{
+				test.Namespaces(
+					builder.ForNamespace("ns-1").Phase(corev1api.NamespaceActive).Result(),
+					builder.ForNamespace("ns-2").Phase(corev1api.NamespaceActive).Result(),
+					builder.ForNamespace("ns-3").Phase(corev1api.NamespaceActive).Result(),
+				),
+				test.Deployments(
+					builder.ForDeployment("ns-1", "deploy-1").Result(),
+					builder.ForDeployment("ns-2", "deploy-2").Result(),
+				),
+			},
+			want: []string{
+				"resources/namespaces/cluster/ns-1.json",
+				"resources/namespaces/v1-preferredversion/cluster/ns-1.json",
+				"resources/namespaces/cluster/ns-3.json",
+				"resources/namespaces/v1-preferredversion/cluster/ns-3.json",
+				"resources/deployments.apps/namespaces/ns-1/deploy-1.json",
+				"resources/deployments.apps/v1-preferredversion/namespaces/ns-1/deploy-1.json",
+			},
+		},
+		{
 			name:   "Empty namespace test",
 			backup: defaultBackup().IncludedNamespaces("invalid*").Result(),
 			apiResources: []*test.APIResource{
@@ -5741,7 +5815,7 @@ func TestResolveResourceFilter(t *testing.T) {
 		{
 			name: "valid label selector",
 			rf: resourcepolicies.ResourceFilter{
-				LabelSelector: map[string]string{"app": "foo"},
+				LabelSelector: &resourcepolicies.PolicyLabelSelector{MatchLabels: map[string]string{"app": "foo"}},
 			},
 			expectErr: false,
 			checkResult: func(t *testing.T, r *ResolvedResourceFilter) {
@@ -5754,16 +5828,16 @@ func TestResolveResourceFilter(t *testing.T) {
 		{
 			name: "invalid label selector",
 			rf: resourcepolicies.ResourceFilter{
-				LabelSelector: map[string]string{"invalid/label/key": "value"},
+				LabelSelector: &resourcepolicies.PolicyLabelSelector{MatchLabels: map[string]string{"invalid/label/key": "value"}},
 			},
 			expectErr: true,
 		},
 		{
 			name: "valid or label selectors",
 			rf: resourcepolicies.ResourceFilter{
-				OrLabelSelectors: []map[string]string{
-					{"app": "foo"},
-					{"app": "bar"},
+				OrLabelSelectors: []*resourcepolicies.PolicyLabelSelector{
+					{MatchLabels: map[string]string{"app": "foo"}},
+					{MatchLabels: map[string]string{"app": "bar"}},
 				},
 			},
 			expectErr: false,
@@ -5776,8 +5850,8 @@ func TestResolveResourceFilter(t *testing.T) {
 		{
 			name: "invalid or label selectors",
 			rf: resourcepolicies.ResourceFilter{
-				OrLabelSelectors: []map[string]string{
-					{"invalid/label/key": "value"},
+				OrLabelSelectors: []*resourcepolicies.PolicyLabelSelector{
+					{MatchLabels: map[string]string{"invalid/label/key": "value"}},
 				},
 			},
 			expectErr: true,
@@ -5796,6 +5870,68 @@ func TestResolveResourceFilter(t *testing.T) {
 				assert.True(t, r.NameIE.ShouldInclude("inc1"))
 				assert.False(t, r.NameIE.ShouldInclude("exc1"))
 			},
+		},
+		{
+			name: "empty labelSelector is no filter",
+			rf: resourcepolicies.ResourceFilter{
+				LabelSelector: &resourcepolicies.PolicyLabelSelector{},
+			},
+			expectErr: false,
+			checkResult: func(t *testing.T, r *ResolvedResourceFilter) {
+				t.Helper()
+				require.NotNil(t, r)
+				assert.Nil(t, r.LabelSelector)
+			},
+		},
+		{
+			name: "set-based In and DoesNotExist",
+			rf: resourcepolicies.ResourceFilter{
+				LabelSelector: &resourcepolicies.PolicyLabelSelector{
+					MatchExpressions: []resourcepolicies.PolicyLabelSelectorRequirement{
+						{Key: "environment", Operator: "In", Values: []string{"prod", "staging"}},
+						{Key: "do-not-backup", Operator: "DoesNotExist"},
+					},
+				},
+			},
+			expectErr: false,
+			checkResult: func(t *testing.T, r *ResolvedResourceFilter) {
+				t.Helper()
+				require.NotNil(t, r.LabelSelector)
+				assert.True(t, r.LabelSelector.Matches(labels.Set{"environment": "prod"}))
+				assert.True(t, r.LabelSelector.Matches(labels.Set{"environment": "staging"}))
+				assert.False(t, r.LabelSelector.Matches(labels.Set{"environment": "dev"}))
+				assert.False(t, r.LabelSelector.Matches(labels.Set{"environment": "prod", "do-not-backup": "true"}))
+			},
+		},
+		{
+			name: "set-based NotIn and Exists",
+			rf: resourcepolicies.ResourceFilter{
+				LabelSelector: &resourcepolicies.PolicyLabelSelector{
+					MatchExpressions: []resourcepolicies.PolicyLabelSelectorRequirement{
+						{Key: "tier", Operator: "NotIn", Values: []string{"debug"}},
+						{Key: "app", Operator: "Exists"},
+					},
+				},
+			},
+			expectErr: false,
+			checkResult: func(t *testing.T, r *ResolvedResourceFilter) {
+				t.Helper()
+				require.NotNil(t, r.LabelSelector)
+				assert.True(t, r.LabelSelector.Matches(labels.Set{"app": "web", "tier": "frontend"}))
+				assert.False(t, r.LabelSelector.Matches(labels.Set{"app": "web", "tier": "debug"}))
+				assert.False(t, r.LabelSelector.Matches(labels.Set{"tier": "frontend"}))
+			},
+		},
+		{
+			name: "invalid operator",
+			rf: resourcepolicies.ResourceFilter{
+				LabelSelector: &resourcepolicies.PolicyLabelSelector{
+					MatchExpressions: []resourcepolicies.PolicyLabelSelectorRequirement{
+						{Key: "env", Operator: "Equals", Values: []string{"prod"}},
+					},
+				},
+			},
+			expectErr: true,
 		},
 	}
 
@@ -5834,11 +5970,11 @@ func TestResolveClusterScopedFilterPolicy(t *testing.T) {
 		ResourceFilters: []resourcepolicies.ResourceFilter{
 			{
 				Kinds:         []string{"pods", "secrets"},
-				LabelSelector: map[string]string{"app": "foo"},
+				LabelSelector: &resourcepolicies.PolicyLabelSelector{MatchLabels: map[string]string{"app": "foo"}},
 			},
 			{
 				Kinds:         []string{"invalid-kind"},
-				LabelSelector: map[string]string{"invalid/label/key": "value"},
+				LabelSelector: &resourcepolicies.PolicyLabelSelector{MatchLabels: map[string]string{"invalid/label/key": "value"}},
 			},
 		},
 	}
@@ -5852,7 +5988,7 @@ func TestResolveClusterScopedFilterPolicy(t *testing.T) {
 		ResourceFilters: []resourcepolicies.ResourceFilter{
 			{
 				Kinds:         []string{"pods", "secrets"},
-				LabelSelector: map[string]string{"app": "foo"},
+				LabelSelector: &resourcepolicies.PolicyLabelSelector{MatchLabels: map[string]string{"app": "foo"}},
 			},
 		},
 	}
@@ -5900,11 +6036,11 @@ func TestResolveNamespacedFilterPolicies(t *testing.T) {
 			ResourceFilters: []resourcepolicies.ResourceFilter{
 				{
 					Kinds:         []string{"pods"},
-					LabelSelector: map[string]string{"app": "foo"},
+					LabelSelector: &resourcepolicies.PolicyLabelSelector{MatchLabels: map[string]string{"app": "foo"}},
 				},
 				{
 					Kinds:         []string{"*"},
-					LabelSelector: map[string]string{"catch": "all"},
+					LabelSelector: &resourcepolicies.PolicyLabelSelector{MatchLabels: map[string]string{"catch": "all"}},
 				},
 			},
 		},
@@ -5932,7 +6068,7 @@ func TestResolveNamespacedFilterPolicies(t *testing.T) {
 			ResourceFilters: []resourcepolicies.ResourceFilter{
 				{
 					Kinds:         []string{"pods"},
-					LabelSelector: map[string]string{"invalid/label/key": "value"},
+					LabelSelector: &resourcepolicies.PolicyLabelSelector{MatchLabels: map[string]string{"invalid/label/key": "value"}},
 				},
 			},
 		},
@@ -6016,7 +6152,7 @@ func TestBackupWithResPoliciesLogs(t *testing.T) {
 		ResourceFilters: []resourcepolicies.ResourceFilter{
 			{
 				Kinds:         []string{"pods"},
-				LabelSelector: map[string]string{"invalid/label/key": "value"},
+				LabelSelector: &resourcepolicies.PolicyLabelSelector{MatchLabels: map[string]string{"invalid/label/key": "value"}},
 			},
 		},
 	}
@@ -6035,7 +6171,7 @@ func TestBackupWithResPoliciesLogs(t *testing.T) {
 			ResourceFilters: []resourcepolicies.ResourceFilter{
 				{
 					Kinds:         []string{"pods"},
-					LabelSelector: map[string]string{"invalid/label/key": "value"},
+					LabelSelector: &resourcepolicies.PolicyLabelSelector{MatchLabels: map[string]string{"invalid/label/key": "value"}},
 				},
 			},
 		},

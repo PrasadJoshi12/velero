@@ -20,6 +20,7 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/cockroachdb/errors"
@@ -74,7 +75,7 @@ type DataDownloadReconciler struct {
 	podResources          corev1api.ResourceRequirements
 	preparingTimeout      time.Duration
 	metrics               *metrics.ServerMetrics
-	cancelledDataDownload map[string]time.Time
+	cancelledDataDownload sync.Map
 	dataMovePriorityClass string
 	repoConfigMgr         repository.ConfigManager
 	podLabels             map[string]string
@@ -118,7 +119,6 @@ func NewDataDownloadReconciler(
 		podResources:          podResources,
 		preparingTimeout:      preparingTimeout,
 		metrics:               metrics,
-		cancelledDataDownload: make(map[string]time.Time),
 		dataMovePriorityClass: dataMovePriorityClass,
 		repoConfigMgr:         repoConfigMgr,
 		podLabels:             podLabels,
@@ -131,6 +131,7 @@ func NewDataDownloadReconciler(
 // +kubebuilder:rbac:groups="",resources=pods,verbs=get
 // +kubebuilder:rbac:groups="",resources=persistentvolumes,verbs=get
 // +kubebuilder:rbac:groups="",resources=persistentvolumerclaims,verbs=get
+// +kubebuilder:rbac:groups="",resources=secrets;configmaps,verbs=get;list;create;delete
 
 func (r *DataDownloadReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	log := r.logger.WithFields(logrus.Fields{
@@ -198,7 +199,7 @@ func (r *DataDownloadReconciler) Reconcile(ctx context.Context, req ctrl.Request
 			}
 		}
 	} else {
-		delete(r.cancelledDataDownload, dd.Name)
+		r.cancelledDataDownload.Delete(dd.Name)
 
 		// put the finalizer remove action here for all cr will goes to the final status, we could check finalizer and do remove action in final status
 		// instead of intermediate state.
@@ -223,9 +224,9 @@ func (r *DataDownloadReconciler) Reconcile(ctx context.Context, req ctrl.Request
 	}
 
 	if dd.Spec.Cancel {
-		if spotted, found := r.cancelledDataDownload[dd.Name]; !found {
-			r.cancelledDataDownload[dd.Name] = r.Clock.Now()
-		} else {
+		v, loaded := r.cancelledDataDownload.LoadOrStore(dd.Name, r.Clock.Now())
+		if loaded {
+			spotted := v.(time.Time)
 			delay := cancelDelayOthers
 			if dd.Status.Phase == velerov2alpha1api.DataDownloadPhaseInProgress {
 				delay = cancelDelayInProgress
@@ -234,7 +235,7 @@ func (r *DataDownloadReconciler) Reconcile(ctx context.Context, req ctrl.Request
 			if time.Since(spotted) > delay {
 				log.Infof("Data download %s is canceled in Phase %s but not handled in rasonable time", dd.GetName(), dd.Status.Phase)
 				if r.tryCancelDataDownload(ctx, dd, "") {
-					delete(r.cancelledDataDownload, dd.Name)
+					r.cancelledDataDownload.Delete(dd.Name)
 				}
 
 				return ctrl.Result{}, nil
@@ -454,7 +455,7 @@ func (r *DataDownloadReconciler) startCancelableDataPath(asyncBR datapath.AsyncB
 
 	if err := asyncBR.StartRestore(dd.Spec.SnapshotID, datapath.AccessPoint{
 		ByPath: res.ByPod.VolumeName,
-	}, dd.Spec.DataMoverConfig); err != nil {
+	}, dd.Spec.DataMoverConfig, nil); err != nil {
 		return errors.Wrapf(err, "error starting async restore for pod %s, volume %s", res.ByPod.HostingPod.Name, res.ByPod.VolumeName)
 	}
 
@@ -466,7 +467,7 @@ func (r *DataDownloadReconciler) OnDataDownloadCompleted(ctx context.Context, na
 	defer r.dataPathMgr.RemoveAsyncBR(ddName)
 
 	log := r.logger.WithField("datadownload", ddName)
-	log.Info("Async fs restore data path completed")
+	log.Info("Async restore data path completed")
 
 	var dd velerov2alpha1api.DataDownload
 	if err := r.client.Get(ctx, types.NamespacedName{Name: ddName, Namespace: namespace}, &dd); err != nil {
@@ -513,7 +514,7 @@ func (r *DataDownloadReconciler) OnDataDownloadFailed(ctx context.Context, names
 
 	log := r.logger.WithField("datadownload", ddName)
 
-	log.WithError(err).Error("Async fs restore data path failed")
+	log.WithError(err).Error("Async restore data path failed")
 
 	var dd velerov2alpha1api.DataDownload
 	if getErr := r.client.Get(ctx, types.NamespacedName{Name: ddName, Namespace: namespace}, &dd); getErr != nil {
@@ -528,7 +529,7 @@ func (r *DataDownloadReconciler) OnDataDownloadCancelled(ctx context.Context, na
 
 	log := r.logger.WithField("datadownload", ddName)
 
-	log.Warn("Async fs backup data path canceled")
+	log.Warn("Async restore data path canceled")
 
 	var dd velerov2alpha1api.DataDownload
 	if getErr := r.client.Get(ctx, types.NamespacedName{Name: ddName, Namespace: namespace}, &dd); getErr != nil {
@@ -556,7 +557,7 @@ func (r *DataDownloadReconciler) OnDataDownloadCancelled(ctx context.Context, na
 		log.WithError(err).Error("error updating data download status")
 	} else {
 		r.metrics.RegisterDataDownloadCancel(r.nodeName)
-		delete(r.cancelledDataDownload, dd.Name)
+		r.cancelledDataDownload.Delete(dd.Name)
 	}
 }
 
@@ -693,11 +694,11 @@ func (r *DataDownloadReconciler) findSnapshotRestoreForPod(ctx context.Context, 
 				r.prepareDataDownload(dd)
 				return true
 			}); err != nil {
-			log.WithError(err).Warn("failed to update dataudownload, prepare will halt for this dataudownload")
+			log.WithError(err).Warn("failed to update datadownload, prepare will halt for this datadownload")
 			return []reconcile.Request{}
 		}
 	} else if unrecoverable, reason := kube.IsPodUnrecoverable(pod, log); unrecoverable {
-		err := UpdateDataDownloadWithRetry(context.Background(), r.client, types.NamespacedName{Namespace: dd.Namespace, Name: dd.Name}, r.logger.WithField("datadownlad", dd.Name),
+		err := UpdateDataDownloadWithRetry(context.Background(), r.client, types.NamespacedName{Namespace: dd.Namespace, Name: dd.Name}, r.logger.WithField("datadownload", dd.Name),
 			func(dataDownload *velerov2alpha1api.DataDownload) bool {
 				if dataDownload.Spec.Cancel {
 					return false
@@ -1096,7 +1097,7 @@ func (r *DataDownloadReconciler) resumeCancellableDataPath(ctx context.Context, 
 
 	if err := asyncBR.StartRestore(dd.Spec.SnapshotID, datapath.AccessPoint{
 		ByPath: res.ByPod.VolumeName,
-	}, nil); err != nil {
+	}, nil, nil); err != nil {
 		return errors.Wrapf(err, "error to resume asyncBR watcher for dd %s", dd.Name)
 	}
 
