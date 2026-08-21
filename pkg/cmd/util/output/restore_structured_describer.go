@@ -22,6 +22,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"strings"
 
 	corev1api "k8s.io/api/core/v1"
@@ -295,12 +296,19 @@ func describeRestoreCSISnapshotsInSF(ctx context.Context, kbClient kbclient.Clie
 		return
 	}
 
+	describeCSISnapshotsRestoresFromReader(d, buf, details)
+}
+
+func describeCSISnapshotsRestoresFromReader(d *StructuredDescriber, r io.Reader, details bool) {
 	var restoreVolInfo []volume.RestoreVolumeInfo
-	if err := json.NewDecoder(buf).Decode(&restoreVolInfo); err != nil {
+	if err := json.NewDecoder(r).Decode(&restoreVolInfo); err != nil {
 		d.Describe("csiSnapshotRestores", fmt.Sprintf("<error reading restore volume info: %v>", err))
 		return
 	}
+	describeCSISnapshotsRestoresInSF(d, restoreVolInfo, details)
+}
 
+func describeCSISnapshotsRestoresInSF(d *StructuredDescriber, restoreVolInfo []volume.RestoreVolumeInfo, details bool) {
 	var nonDMInfoList, dmInfoList []volume.RestoreVolumeInfo
 	for _, info := range restoreVolInfo {
 		if info.RestoreMethod != volume.CSISnapshot {
@@ -368,7 +376,6 @@ func describeRestoreResultsInSF(ctx context.Context, kbClient kbclient.Client, d
 	}
 
 	var buf bytes.Buffer
-	var resultMap map[string]results.Result
 
 	warnings, errs := make(map[string]any), make(map[string]any)
 	defer func() {
@@ -390,7 +397,12 @@ func describeRestoreResultsInSF(ctx context.Context, kbClient kbclient.Client, d
 		return
 	}
 
-	if err := json.NewDecoder(&buf).Decode(&resultMap); err != nil {
+	describeRestoreResultsFromReader(warnings, errs, &buf, restore)
+}
+
+func describeRestoreResultsFromReader(warnings, errs map[string]any, r io.Reader, restore *velerov1api.Restore) {
+	var resultMap map[string]results.Result
+	if err := json.NewDecoder(r).Decode(&resultMap); err != nil {
 		if restore.Status.Warnings > 0 {
 			warnings["errorDecodingWarnings"] = fmt.Sprintf("<error decoding warnings: %v>", err)
 		}
@@ -437,8 +449,12 @@ func describeRestoreItemOperationsInSF(ctx context.Context, kbClient kbclient.Cl
 		return
 	}
 
+	describeRestoreItemOperationsFromReader(d, opsInfo, buf)
+}
+
+func describeRestoreItemOperationsFromReader(d *StructuredDescriber, opsInfo map[string]any, r io.Reader) {
 	var operations []*itemoperation.RestoreOperation
-	if err := json.NewDecoder(buf).Decode(&operations); err != nil {
+	if err := json.NewDecoder(r).Decode(&operations); err != nil {
 		opsInfo["errorReadingOperations"] = fmt.Sprintf("<error reading operation info: %v>", err)
 		d.Describe("restoreItemOperations", opsInfo)
 		return
@@ -446,38 +462,42 @@ func describeRestoreItemOperationsInSF(ctx context.Context, kbClient kbclient.Cl
 
 	opsList := make([]map[string]any, 0, len(operations))
 	for _, op := range operations {
-		opEntry := map[string]any{
-			"resource":                fmt.Sprintf("%s %s/%s", op.Spec.ResourceIdentifier, op.Spec.ResourceIdentifier.Namespace, op.Spec.ResourceIdentifier.Name),
-			"restoreItemActionPlugin": op.Spec.RestoreItemAction,
-			"operationID":             op.Spec.OperationID,
-			"phase":                   op.Status.Phase,
-		}
-		if op.Status.Error != "" {
-			opEntry["error"] = op.Status.Error
-		}
-		if op.Status.NTotal > 0 || op.Status.NCompleted > 0 {
-			opEntry["progress"] = map[string]any{
-				"completed": op.Status.NCompleted,
-				"total":     op.Status.NTotal,
-				"units":     op.Status.OperationUnits,
-			}
-		}
-		if op.Status.Description != "" {
-			opEntry["progressDescription"] = op.Status.Description
-		}
-		if op.Status.Created != nil {
-			opEntry["created"] = op.Status.Created.String()
-		}
-		if op.Status.Started != nil {
-			opEntry["started"] = op.Status.Started.String()
-		}
-		if op.Status.Updated != nil {
-			opEntry["updated"] = op.Status.Updated.String()
-		}
-		opsList = append(opsList, opEntry)
+		opsList = append(opsList, describeRestoreItemOperationInSF(op))
 	}
 	opsInfo["operations"] = opsList
 	d.Describe("restoreItemOperations", opsInfo)
+}
+
+func describeRestoreItemOperationInSF(op *itemoperation.RestoreOperation) map[string]any {
+	opEntry := map[string]any{
+		"resource":                fmt.Sprintf("%s %s/%s", op.Spec.ResourceIdentifier, op.Spec.ResourceIdentifier.Namespace, op.Spec.ResourceIdentifier.Name),
+		"restoreItemActionPlugin": op.Spec.RestoreItemAction,
+		"operationID":             op.Spec.OperationID,
+		"phase":                   op.Status.Phase,
+	}
+	if op.Status.Error != "" {
+		opEntry["error"] = op.Status.Error
+	}
+	if op.Status.NTotal > 0 || op.Status.NCompleted > 0 {
+		opEntry["progress"] = map[string]any{
+			"completed": op.Status.NCompleted,
+			"total":     op.Status.NTotal,
+			"units":     op.Status.OperationUnits,
+		}
+	}
+	if op.Status.Description != "" {
+		opEntry["progressDescription"] = op.Status.Description
+	}
+	if op.Status.Created != nil {
+		opEntry["created"] = op.Status.Created.String()
+	}
+	if op.Status.Started != nil {
+		opEntry["started"] = op.Status.Started.String()
+	}
+	if op.Status.Updated != nil {
+		opEntry["updated"] = op.Status.Updated.String()
+	}
+	return opEntry
 }
 
 func describeRestoreResourceListInSF(ctx context.Context, kbClient kbclient.Client, d *StructuredDescriber, restore *velerov1api.Restore, insecureSkipTLSVerify bool, caCertPath string) {
@@ -496,8 +516,12 @@ func describeRestoreResourceListInSF(ctx context.Context, kbClient kbclient.Clie
 		return
 	}
 
+	describeRestoreResourceListFromReader(d, buf)
+}
+
+func describeRestoreResourceListFromReader(d *StructuredDescriber, r io.Reader) {
 	var resourceList map[string][]string
-	if err := json.NewDecoder(buf).Decode(&resourceList); err != nil {
+	if err := json.NewDecoder(r).Decode(&resourceList); err != nil {
 		d.Describe("resourceList", fmt.Sprintf("<error reading restore resource list: %v>", err))
 		return
 	}

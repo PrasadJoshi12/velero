@@ -17,18 +17,25 @@ limitations under the License.
 package output
 
 import (
-	"reflect"
+	"bytes"
+	"context"
+	"encoding/json"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	corev1api "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	"github.com/vmware-tanzu/velero/internal/volume"
 	velerov1api "github.com/vmware-tanzu/velero/pkg/apis/velero/v1"
 	"github.com/vmware-tanzu/velero/pkg/builder"
+	"github.com/vmware-tanzu/velero/pkg/itemoperation"
+	"github.com/vmware-tanzu/velero/pkg/test"
 	"github.com/vmware-tanzu/velero/pkg/util/boolptr"
+	"github.com/vmware-tanzu/velero/pkg/util/results"
 )
 
 func TestDescribeRestoreProgressInSF(t *testing.T) {
@@ -75,7 +82,7 @@ func TestDescribeRestoreProgressInSF(t *testing.T) {
 		t.Run(tc.name, func(tt *testing.T) {
 			sd := &StructuredDescriber{output: make(map[string]any), format: ""}
 			describeRestoreProgressInSF(sd, tc.input)
-			assert.True(tt, reflect.DeepEqual(sd.output, tc.expect))
+			assert.Equal(tt, tc.expect, sd.output)
 		})
 	}
 }
@@ -121,7 +128,7 @@ func TestDescribeRestoreTimestampsInSF(t *testing.T) {
 		t.Run(tc.name, func(tt *testing.T) {
 			sd := &StructuredDescriber{output: make(map[string]any), format: ""}
 			describeRestoreTimestampsInSF(sd, tc.input)
-			assert.True(tt, reflect.DeepEqual(sd.output, tc.expect))
+			assert.Equal(tt, tc.expect, sd.output)
 		})
 	}
 }
@@ -234,12 +241,58 @@ func TestDescribeRestoreSpecInSF(t *testing.T) {
 				},
 			},
 		},
+		{
+			name: "namespaces, mappings, selectors, resource policy and flags",
+			spec: velerov1api.RestoreSpec{
+				BackupName:              "backup-4",
+				IncludedNamespaces:      []string{"ns-a", "ns-b"},
+				NamespaceMapping:        map[string]string{"ns-a": "ns-a-new"},
+				LabelSelector:           &metav1.LabelSelector{MatchLabels: map[string]string{"app": "nginx"}},
+				OrLabelSelectors:        []*metav1.LabelSelector{{MatchLabels: map[string]string{"env": "prod"}}, {MatchLabels: map[string]string{"env": "stage"}}},
+				IncludeClusterResources: boolptr.True(),
+				RestorePVs:              boolptr.True(),
+				PreserveNodePorts:       boolptr.False(),
+				ResourcePolicy: &corev1api.TypedLocalObjectReference{
+					Kind: "configmap",
+					Name: "volume-policy",
+				},
+				UploaderConfig: &velerov1api.UploaderConfigForRestore{
+					WriteSparseFiles: boolptr.False(),
+				},
+			},
+			expect: map[string]any{
+				"spec": map[string]any{
+					"backupName": "backup-4",
+					"namespaces": map[string]any{
+						"included": "ns-a, ns-b",
+						"excluded": emptyDisplay,
+					},
+					"resources": map[string]string{
+						"included":      "*",
+						"excluded":      emptyDisplay,
+						"clusterScoped": "included",
+					},
+					"namespaceMappings":      map[string]string{"ns-a": "ns-a-new"},
+					"labelSelector":          "app=nginx",
+					"orLabelSelectors":       "env=prod or env=stage",
+					"restorePVs":             "true",
+					"existingResourcePolicy": emptyDisplay,
+					"itemOperationTimeout":   "0s",
+					"preserveNodePorts":      "false",
+					"resourcePolicy": map[string]any{
+						"type": "configmap",
+						"name": "volume-policy",
+					},
+					"uploaderConfig": map[string]any{},
+				},
+			},
+		},
 	}
 	for _, tc := range testcases {
 		t.Run(tc.name, func(tt *testing.T) {
 			sd := &StructuredDescriber{output: make(map[string]any), format: ""}
 			describeRestoreSpecInSF(sd, tc.spec)
-			assert.True(tt, reflect.DeepEqual(sd.output, tc.expect))
+			assert.Equal(tt, tc.expect, sd.output)
 		})
 	}
 }
@@ -322,7 +375,7 @@ func TestDescribePodVolumeRestoresInSF(t *testing.T) {
 		t.Run(tc.name, func(tt *testing.T) {
 			sd := &StructuredDescriber{output: make(map[string]any), format: ""}
 			describePodVolumeRestoresInSF(sd, tc.restores, tc.details)
-			assert.True(tt, reflect.DeepEqual(sd.output, tc.expect))
+			assert.Equal(tt, tc.expect, sd.output)
 		})
 	}
 }
@@ -434,77 +487,80 @@ func TestDescribeRestoreCSISnapshotsInSF_NoData(t *testing.T) {
 				},
 			},
 		},
+		{
+			name: "data movement entry, no details",
+			inputVolInfoList: []volume.RestoreVolumeInfo{
+				{
+					RestoreMethod:     volume.CSISnapshot,
+					SnapshotDataMoved: true,
+					PVCName:           "pvc-3",
+					PVCNamespace:      "ns-3",
+					SnapshotDataMovementInfo: &volume.SnapshotDataMovementInfo{
+						OperationID:  "op-3",
+						DataMover:    "velero",
+						UploaderType: "kopia",
+					},
+				},
+			},
+			details: false,
+			expect: map[string]any{
+				"csiSnapshotRestores": map[string]any{
+					"ns-3/pvc-3": map[string]any{
+						"dataMovement": "specify --details for more information",
+					},
+				},
+			},
+		},
 	}
 
 	for _, tc := range testcases {
 		t.Run(tc.name, func(tt *testing.T) {
 			sd := &StructuredDescriber{output: make(map[string]any), format: ""}
 			describeCSISnapshotsRestoresInSF(sd, tc.inputVolInfoList, tc.details)
-			assert.True(tt, reflect.DeepEqual(sd.output, tc.expect))
+			assert.Equal(tt, tc.expect, sd.output)
 		})
 	}
 }
 
-// describeCSISnapshotsRestoresInSF is a testable wrapper around the inline CSI logic
-// used by describeRestoreCSISnapshotsInSF (which also fetches data from object storage).
-func describeCSISnapshotsRestoresInSF(d *StructuredDescriber, restoreVolInfo []volume.RestoreVolumeInfo, details bool) {
-	var nonDMInfoList, dmInfoList []volume.RestoreVolumeInfo
-	for _, info := range restoreVolInfo {
-		if info.RestoreMethod != volume.CSISnapshot {
-			continue
-		}
-		if info.SnapshotDataMoved {
-			dmInfoList = append(dmInfoList, info)
-		} else {
-			nonDMInfoList = append(nonDMInfoList, info)
-		}
-	}
+func TestDescribeCSISnapshotsRestoresFromReader(t *testing.T) {
+	t.Run("invalid json", func(t *testing.T) {
+		sd := &StructuredDescriber{output: make(map[string]any), format: ""}
+		describeCSISnapshotsRestoresFromReader(sd, strings.NewReader("not-json"), false)
+		got, ok := sd.output["csiSnapshotRestores"].(string)
+		require.True(t, ok)
+		assert.Contains(t, got, "<error reading restore volume info:")
+	})
 
-	if len(nonDMInfoList) == 0 && len(dmInfoList) == 0 {
-		d.Describe("csiSnapshotRestores", "<none included>")
-		return
-	}
-
-	csiRestores := map[string]any{}
-
-	for _, info := range nonDMInfoList {
-		key := info.PVCNamespace + "/" + info.PVCName
-		if details {
-			csiRestores[key] = map[string]any{
-				"snapshot": map[string]any{
-					"snapshotContentName": info.CSISnapshotInfo.VSCName,
-					"storageSnapshotID":   info.CSISnapshotInfo.SnapshotHandle,
-					"csiDriver":           info.CSISnapshotInfo.Driver,
+	t.Run("valid json", func(t *testing.T) {
+		volInfo := []volume.RestoreVolumeInfo{
+			{
+				RestoreMethod: volume.CSISnapshot,
+				PVCName:       "pvc-1",
+				PVCNamespace:  "ns-1",
+				CSISnapshotInfo: &volume.CSISnapshotInfo{
+					VSCName:        "vsc-1",
+					SnapshotHandle: "snap-handle-1",
+					Driver:         "csi.test.driver",
 				},
-			}
-		} else {
-			csiRestores[key] = map[string]any{
-				"snapshot": "specify --details for more information",
-			}
+			},
 		}
-	}
+		data, err := json.Marshal(volInfo)
+		require.NoError(t, err)
 
-	for _, info := range dmInfoList {
-		key := info.PVCNamespace + "/" + info.PVCName
-		if details {
-			csiRestores[key] = map[string]any{
-				"dataMovement": map[string]any{
-					"operationID":  info.SnapshotDataMovementInfo.OperationID,
-					"dataMover":    info.SnapshotDataMovementInfo.DataMover,
-					"uploaderType": info.SnapshotDataMovementInfo.UploaderType,
+		sd := &StructuredDescriber{output: make(map[string]any), format: ""}
+		describeCSISnapshotsRestoresFromReader(sd, bytes.NewReader(data), false)
+		assert.Equal(t, map[string]any{
+			"csiSnapshotRestores": map[string]any{
+				"ns-1/pvc-1": map[string]any{
+					"snapshot": "specify --details for more information",
 				},
-			}
-		} else {
-			csiRestores[key] = map[string]any{
-				"dataMovement": "specify --details for more information",
-			}
-		}
-	}
-
-	d.Describe("csiSnapshotRestores", csiRestores)
+			},
+		}, sd.output)
+	})
 }
 
 func TestDescribeRestoreItemOperationsInSF_NoDownload(t *testing.T) {
+	kbClient := test.NewFakeControllerRuntimeClient(t)
 	testcases := []struct {
 		name   string
 		status velerov1api.RestoreStatus
@@ -538,21 +594,103 @@ func TestDescribeRestoreItemOperationsInSF_NoDownload(t *testing.T) {
 			restore.Status = tc.status
 
 			sd := &StructuredDescriber{output: make(map[string]any), format: ""}
-
-			if restore.Status.RestoreItemOperationsAttempted == 0 {
-				// mirrors the early-return path in the real function
-			} else {
-				opsInfo := map[string]any{
-					"attempted": restore.Status.RestoreItemOperationsAttempted,
-					"completed": restore.Status.RestoreItemOperationsCompleted,
-					"failed":    restore.Status.RestoreItemOperationsFailed,
-				}
-				sd.Describe("restoreItemOperations", opsInfo)
-			}
-
-			assert.True(tt, reflect.DeepEqual(sd.output, tc.expect))
+			describeRestoreItemOperationsInSF(context.Background(), kbClient, sd, restore, false, false, "")
+			assert.Equal(tt, tc.expect, sd.output)
 		})
 	}
+}
+
+func TestDescribeRestoreItemOperationsInSF_DownloadError(t *testing.T) {
+	kbClient := test.NewFakeControllerRuntimeClient(t)
+	restore := builder.ForRestore("velero", "r1").Result()
+	restore.Status.RestoreItemOperationsAttempted = 2
+	restore.Status.RestoreItemOperationsCompleted = 1
+	restore.Status.RestoreItemOperationsFailed = 1
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	sd := &StructuredDescriber{output: make(map[string]any), format: ""}
+	describeRestoreItemOperationsInSF(ctx, kbClient, sd, restore, true, false, "")
+
+	ops, ok := sd.output["restoreItemOperations"].(map[string]any)
+	require.True(t, ok)
+	assert.Equal(t, 2, ops["attempted"])
+	assert.Equal(t, 1, ops["completed"])
+	assert.Equal(t, 1, ops["failed"])
+	_, hasErr := ops["errorGettingOperations"]
+	assert.True(t, hasErr)
+}
+
+func TestDescribeRestoreItemOperationInSF(t *testing.T) {
+	t1 := time.Date(2023, 6, 26, 0, 0, 0, 0, time.UTC)
+	t2 := time.Date(2023, 6, 25, 0, 0, 0, 0, time.UTC)
+	t3 := time.Date(2023, 6, 24, 0, 0, 0, 0, time.UTC)
+
+	input := builder.ForRestoreOperation().
+		RestoreName("restore-1").
+		OperationID("op-1").
+		RestoreItemAction("action-1").
+		ResourceIdentifier("group", "rs-type", "ns", "rs-name").
+		Status(*builder.ForOperationStatus().
+			Phase(itemoperation.OperationPhaseFailed).
+			Error("operation error").
+			Progress(50, 100, "bytes").
+			Description("operation description").
+			Created(t3).
+			Started(t2).
+			Updated(t1).
+			Result()).Result()
+
+	got := describeRestoreItemOperationInSF(input)
+	assert.Equal(t, "operation error", got["error"])
+	assert.Equal(t, "op-1", got["operationID"])
+	assert.Equal(t, "action-1", got["restoreItemActionPlugin"])
+	assert.Equal(t, itemoperation.OperationPhaseFailed, got["phase"])
+	assert.Equal(t, "operation description", got["progressDescription"])
+	assert.Equal(t, t3.String(), got["created"])
+	assert.Equal(t, t2.String(), got["started"])
+	assert.Equal(t, t1.String(), got["updated"])
+	assert.Equal(t, map[string]any{
+		"completed": int64(50),
+		"total":     int64(100),
+		"units":     "bytes",
+	}, got["progress"])
+}
+
+func TestDescribeRestoreItemOperationsFromReader(t *testing.T) {
+	t.Run("invalid json", func(t *testing.T) {
+		sd := &StructuredDescriber{output: make(map[string]any), format: ""}
+		opsInfo := map[string]any{"attempted": 1}
+		describeRestoreItemOperationsFromReader(sd, opsInfo, strings.NewReader("not-json"))
+		got, ok := sd.output["restoreItemOperations"].(map[string]any)
+		require.True(t, ok)
+		_, hasErr := got["errorReadingOperations"]
+		assert.True(t, hasErr)
+	})
+
+	t.Run("valid json", func(t *testing.T) {
+		op := builder.ForRestoreOperation().
+			RestoreName("restore-1").
+			OperationID("op-1").
+			RestoreItemAction("action-1").
+			ResourceIdentifier("group", "rs-type", "ns", "rs-name").
+			Status(*builder.ForOperationStatus().Phase(itemoperation.OperationPhaseCompleted).Result()).
+			Result()
+		data, err := json.Marshal([]*itemoperation.RestoreOperation{op})
+		require.NoError(t, err)
+
+		sd := &StructuredDescriber{output: make(map[string]any), format: ""}
+		opsInfo := map[string]any{"attempted": 1, "completed": 1, "failed": 0}
+		describeRestoreItemOperationsFromReader(sd, opsInfo, bytes.NewReader(data))
+
+		got, ok := sd.output["restoreItemOperations"].(map[string]any)
+		require.True(t, ok)
+		ops, ok := got["operations"].([]map[string]any)
+		require.True(t, ok)
+		require.Len(t, ops, 1)
+		assert.Equal(t, "op-1", ops[0]["operationID"])
+	})
 }
 
 func TestDescribeResourceModifierInSF(t *testing.T) {
@@ -564,6 +702,222 @@ func TestDescribeResourceModifierInSF(t *testing.T) {
 		"type": "ConfigMap",
 		"name": "my-modifier",
 	}
-	got := describeResourceModifierInSF(input)
-	assert.True(t, reflect.DeepEqual(got, expect))
+	assert.Equal(t, expect, describeResourceModifierInSF(input))
+}
+
+func TestDescribeRestoreResultsFromReader(t *testing.T) {
+	restoreBoth := builder.ForRestore("velero", "r1").Result()
+	restoreBoth.Status.Warnings = 2
+	restoreBoth.Status.Errors = 1
+
+	t.Run("invalid json", func(t *testing.T) {
+		warnings, errs := make(map[string]any), make(map[string]any)
+		describeRestoreResultsFromReader(warnings, errs, strings.NewReader("not-json"), restoreBoth)
+		_, hasWarn := warnings["errorDecodingWarnings"]
+		_, hasErr := errs["errorDecodingErrors"]
+		assert.True(t, hasWarn)
+		assert.True(t, hasErr)
+	})
+
+	t.Run("valid json", func(t *testing.T) {
+		payload := map[string]results.Result{
+			"warnings": {
+				Velero:  []string{"w1"},
+				Cluster: []string{"c1"},
+				Namespaces: map[string][]string{
+					"ns-1": {"n1"},
+				},
+			},
+			"errors": {
+				Velero: []string{"e1"},
+			},
+		}
+		data, err := json.Marshal(payload)
+		require.NoError(t, err)
+
+		warnings, errs := make(map[string]any), make(map[string]any)
+		describeRestoreResultsFromReader(warnings, errs, bytes.NewReader(data), restoreBoth)
+		assert.Equal(t, []string{"w1"}, warnings["velero"])
+		assert.Equal(t, []string{"c1"}, warnings["cluster"])
+		assert.Equal(t, map[string][]string{"ns-1": {"n1"}}, warnings["namespace"])
+		assert.Equal(t, []string{"e1"}, errs["velero"])
+	})
+
+	t.Run("warnings only decode error", func(t *testing.T) {
+		restore := builder.ForRestore("velero", "r2").Result()
+		restore.Status.Warnings = 1
+		warnings, errs := make(map[string]any), make(map[string]any)
+		describeRestoreResultsFromReader(warnings, errs, strings.NewReader("not-json"), restore)
+		_, hasWarn := warnings["errorDecodingWarnings"]
+		assert.True(t, hasWarn)
+		assert.Empty(t, errs)
+	})
+
+	t.Run("errors only decode error", func(t *testing.T) {
+		restore := builder.ForRestore("velero", "r3").Result()
+		restore.Status.Errors = 1
+		warnings, errs := make(map[string]any), make(map[string]any)
+		describeRestoreResultsFromReader(warnings, errs, strings.NewReader("not-json"), restore)
+		_, hasErr := errs["errorDecodingErrors"]
+		assert.True(t, hasErr)
+		assert.Empty(t, warnings)
+	})
+}
+
+func TestDescribeRestoreResultsInSF(t *testing.T) {
+	kbClient := test.NewFakeControllerRuntimeClient(t)
+
+	t.Run("no warnings or errors", func(t *testing.T) {
+		sd := &StructuredDescriber{output: make(map[string]any), format: ""}
+		restore := builder.ForRestore("velero", "r1").Result()
+		describeRestoreResultsInSF(context.Background(), kbClient, sd, restore, false, "")
+		assert.Empty(t, sd.output)
+	})
+
+	t.Run("download error", func(t *testing.T) {
+		restore := builder.ForRestore("velero", "r1").Result()
+		restore.Status.Warnings = 1
+		restore.Status.Errors = 1
+
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+
+		sd := &StructuredDescriber{output: make(map[string]any), format: ""}
+		describeRestoreResultsInSF(ctx, kbClient, sd, restore, false, "")
+
+		warnings, ok := sd.output["warnings"].(map[string]any)
+		require.True(t, ok)
+		_, hasWarn := warnings["errorGettingWarnings"]
+		assert.True(t, hasWarn)
+
+		errs, ok := sd.output["errors"].(map[string]any)
+		require.True(t, ok)
+		_, hasErr := errs["errorGettingErrors"]
+		assert.True(t, hasErr)
+	})
+
+	t.Run("download error warnings only", func(t *testing.T) {
+		restore := builder.ForRestore("velero", "r1").Result()
+		restore.Status.Warnings = 1
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+
+		sd := &StructuredDescriber{output: make(map[string]any), format: ""}
+		describeRestoreResultsInSF(ctx, kbClient, sd, restore, false, "")
+		_, hasWarn := sd.output["warnings"]
+		_, hasErr := sd.output["errors"]
+		assert.True(t, hasWarn)
+		assert.False(t, hasErr)
+	})
+
+	t.Run("download error errors only", func(t *testing.T) {
+		restore := builder.ForRestore("velero", "r1").Result()
+		restore.Status.Errors = 1
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+
+		sd := &StructuredDescriber{output: make(map[string]any), format: ""}
+		describeRestoreResultsInSF(ctx, kbClient, sd, restore, false, "")
+		_, hasWarn := sd.output["warnings"]
+		_, hasErr := sd.output["errors"]
+		assert.False(t, hasWarn)
+		assert.True(t, hasErr)
+	})
+}
+
+func TestDescribeRestoreResourceListFromReader(t *testing.T) {
+	t.Run("invalid json", func(t *testing.T) {
+		sd := &StructuredDescriber{output: make(map[string]any), format: ""}
+		describeRestoreResourceListFromReader(sd, strings.NewReader("not-json"))
+		got, ok := sd.output["resourceList"].(string)
+		require.True(t, ok)
+		assert.Contains(t, got, "<error reading restore resource list:")
+	})
+
+	t.Run("valid json", func(t *testing.T) {
+		sd := &StructuredDescriber{output: make(map[string]any), format: ""}
+		payload := map[string][]string{"v1/Pod": {"ns/pod-1"}}
+		data, err := json.Marshal(payload)
+		require.NoError(t, err)
+		describeRestoreResourceListFromReader(sd, bytes.NewReader(data))
+		assert.Equal(t, payload, sd.output["resourceList"])
+	})
+}
+
+func TestDescribeRestoreResourceListInSF_DownloadError(t *testing.T) {
+	kbClient := test.NewFakeControllerRuntimeClient(t)
+	restore := builder.ForRestore("velero", "r1").Result()
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	sd := &StructuredDescriber{output: make(map[string]any), format: ""}
+	describeRestoreResourceListInSF(ctx, kbClient, sd, restore, false, "")
+	got, ok := sd.output["resourceList"].(string)
+	require.True(t, ok)
+	assert.Contains(t, got, "<error getting restore resource list:")
+}
+
+func TestDescribeRestoreCSISnapshotsInSF_DownloadError(t *testing.T) {
+	kbClient := test.NewFakeControllerRuntimeClient(t)
+	restore := builder.ForRestore("velero", "r1").Result()
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	sd := &StructuredDescriber{output: make(map[string]any), format: ""}
+	describeRestoreCSISnapshotsInSF(ctx, kbClient, sd, restore, false, false, "")
+	got, ok := sd.output["csiSnapshotRestores"].(string)
+	require.True(t, ok)
+	assert.Contains(t, got, "<error getting restore volume info:")
+}
+
+func TestDescribeRestoreInSF(t *testing.T) {
+	kbClient := test.NewFakeControllerRuntimeClient(t)
+	started := metav1.NewTime(time.Date(2024, 1, 10, 12, 0, 0, 0, time.UTC))
+	completed := metav1.NewTime(time.Date(2024, 1, 10, 13, 0, 0, 0, time.UTC))
+	deletedAt := metav1.NewTime(time.Date(2024, 1, 10, 14, 0, 0, 0, time.UTC))
+
+	pvr := builder.ForPodVolumeRestore("velero", "pvr-1").
+		UploaderType("kopia").
+		Phase(velerov1api.PodVolumeRestorePhaseCompleted).
+		Volume("vol-1").
+		PodName("pod-1").
+		PodNamespace("ns-1").Result()
+
+	restore := builder.ForRestore("velero", "restore-1").
+		Backup("backup-1").
+		Phase(velerov1api.RestorePhaseCompleted).
+		ObjectMeta(builder.WithLabels("app", "velero"), builder.WithAnnotations("a", "b")).
+		Result()
+	restore.DeletionTimestamp = &deletedAt
+	restore.Status.StartTimestamp = &started
+	restore.Status.CompletionTimestamp = &completed
+	restore.Status.Progress = &velerov1api.RestoreProgress{TotalItems: 10, ItemsRestored: 10}
+	restore.Status.ValidationErrors = []string{"invalid include"}
+	restore.Status.Warnings = 1
+	restore.Status.Errors = 1
+	restore.Status.RestoreItemOperationsAttempted = 2
+	restore.Status.RestoreItemOperationsCompleted = 2
+	restore.Status.HookStatus = &velerov1api.HookStatus{HooksAttempted: 3, HooksFailed: 1}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	out := DescribeRestoreInSF(ctx, kbClient, restore, []velerov1api.PodVolumeRestore{*pvr}, true, false, "", "json")
+
+	var parsed map[string]any
+	require.NoError(t, json.Unmarshal([]byte(out), &parsed))
+	assert.Equal(t, "Completed (Deleting)", parsed["phase"])
+	assert.Contains(t, parsed, "metadata")
+	assert.Contains(t, parsed, "progress")
+	assert.Contains(t, parsed, "timestamps")
+	assert.Contains(t, parsed, "spec")
+	assert.Contains(t, parsed, "podVolumeRestores")
+	assert.Contains(t, parsed, "hookStatus")
+	assert.Equal(t, []any{"invalid include"}, parsed["validationErrors"])
+
+	t.Run("empty phase defaults to New", func(t *testing.T) {
+		r := builder.ForRestore("velero", "restore-2").Result()
+		out := DescribeRestoreInSF(ctx, kbClient, r, nil, false, false, "", "json")
+		require.Contains(t, out, `"phase": "New"`)
+	})
 }
