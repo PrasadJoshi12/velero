@@ -511,6 +511,45 @@ func TestDescribeRestoreCSISnapshotsInSF_NoData(t *testing.T) {
 				},
 			},
 		},
+		{
+			name: "CSI snapshot with details and nil CSISnapshotInfo",
+			inputVolInfoList: []volume.RestoreVolumeInfo{
+				{
+					RestoreMethod:   volume.CSISnapshot,
+					PVCName:         "pvc-4",
+					PVCNamespace:    "ns-4",
+					CSISnapshotInfo: nil,
+				},
+			},
+			details: true,
+			expect: map[string]any{
+				"csiSnapshotRestores": map[string]any{
+					"ns-4/pvc-4": map[string]any{
+						"snapshot": "<CSI snapshot info not found>",
+					},
+				},
+			},
+		},
+		{
+			name: "data movement with details and nil SnapshotDataMovementInfo",
+			inputVolInfoList: []volume.RestoreVolumeInfo{
+				{
+					RestoreMethod:            volume.CSISnapshot,
+					SnapshotDataMoved:        true,
+					PVCName:                  "pvc-5",
+					PVCNamespace:             "ns-5",
+					SnapshotDataMovementInfo: nil,
+				},
+			},
+			details: true,
+			expect: map[string]any{
+				"csiSnapshotRestores": map[string]any{
+					"ns-5/pvc-5": map[string]any{
+						"dataMovement": "<snapshot data movement info not found>",
+					},
+				},
+			},
+		},
 	}
 
 	for _, tc := range testcases {

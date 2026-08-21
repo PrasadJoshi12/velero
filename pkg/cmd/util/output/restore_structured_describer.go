@@ -331,6 +331,12 @@ func describeCSISnapshotsRestoresInSF(d *StructuredDescriber, restoreVolInfo []v
 	for _, info := range nonDMInfoList {
 		key := fmt.Sprintf("%s/%s", info.PVCNamespace, info.PVCName)
 		if details {
+			if info.CSISnapshotInfo == nil {
+				csiRestores[key] = map[string]any{
+					"snapshot": "<CSI snapshot info not found>",
+				}
+				continue
+			}
 			csiRestores[key] = map[string]any{
 				"snapshot": map[string]any{
 					"snapshotContentName": info.CSISnapshotInfo.VSCName,
@@ -348,6 +354,12 @@ func describeCSISnapshotsRestoresInSF(d *StructuredDescriber, restoreVolInfo []v
 	for _, info := range dmInfoList {
 		key := fmt.Sprintf("%s/%s", info.PVCNamespace, info.PVCName)
 		if details {
+			if info.SnapshotDataMovementInfo == nil {
+				csiRestores[key] = map[string]any{
+					"dataMovement": "<snapshot data movement info not found>",
+				}
+				continue
+			}
 			csiRestores[key] = map[string]any{
 				"dataMovement": map[string]any{
 					"operationID":  info.SnapshotDataMovementInfo.OperationID,
