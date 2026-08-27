@@ -266,7 +266,7 @@ func describePodVolumeRestoresInSF(d *StructuredDescriber, restores []velerov1ap
 
 		restoresByPod := new(volumesByPod)
 		for _, restore := range restoresByPhase[phase] {
-			restoresByPod.Add(restore.Spec.Pod.Namespace, restore.Spec.Pod.Name, restore.Spec.Volume, phase, restore.Status.Progress, 0)
+			restoresByPod.Add(restore.Spec.Pod.Namespace, restore.Spec.Pod.Name, restore.Spec.Volume, phase, restore.Status.Progress, nil)
 		}
 
 		podEntries := make([]map[string]string, 0)

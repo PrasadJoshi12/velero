@@ -174,7 +174,7 @@ func TestDescribeRestoreSpecInSF(t *testing.T) {
 				ExcludedNamespaces:     []string{"kube-system"},
 				IncludedResources:      []string{"pods", "configmaps"},
 				ExcludedResources:      []string{"secrets"},
-				ExistingResourcePolicy: velerov1api.PolicyTypeUpdate,
+				ExistingResourcePolicy: velerov1api.ResourcePolicyTypeUpdate,
 			},
 			expect: map[string]any{
 				"spec": map[string]any{
@@ -192,7 +192,7 @@ func TestDescribeRestoreSpecInSF(t *testing.T) {
 					"labelSelector":          emptyDisplay,
 					"orLabelSelectors":       emptyDisplay,
 					"restorePVs":             "auto",
-					"existingResourcePolicy": string(velerov1api.PolicyTypeUpdate),
+					"existingResourcePolicy": string(velerov1api.ResourcePolicyTypeUpdate),
 					"itemOperationTimeout":   "0s",
 					"preserveNodePorts":      "auto",
 				},
