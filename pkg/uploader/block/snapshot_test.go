@@ -21,16 +21,19 @@ package block
 import (
 	"context"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/cockroachdb/errors"
 	"github.com/sirupsen/logrus"
+	logrustest "github.com/sirupsen/logrus/hooks/test"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
 
 	"github.com/vmware-tanzu/velero/pkg/cbtservice"
+	cbtservicemocks "github.com/vmware-tanzu/velero/pkg/cbtservice/mocks"
 	"github.com/vmware-tanzu/velero/pkg/repository/udmrepo"
 	udmrepomocks "github.com/vmware-tanzu/velero/pkg/repository/udmrepo/mocks"
 	"github.com/vmware-tanzu/velero/pkg/uploader"
@@ -121,6 +124,23 @@ func TestBackup(t *testing.T) {
 				assert.Positive(t, info.Size)
 			},
 		},
+		{
+			name: "success with CBT",
+			setupOpenDev: func(t *testing.T) *os.File {
+				t.Helper()
+				return tempFile(t, "test-block-data")
+			},
+			setupMocks: func(blkup *mockUploader, repo *udmrepomocks.BackupRepo) {
+				blkup.On("Backup", mock.Anything, mock.Anything, mock.Anything, mock.Anything).
+					Return(udmrepo.Snapshot{RootObject: udmrepo.ObjectMetadata{ID: "root"}}, int64(8), nil)
+				repo.On("SaveSnapshot", mock.Anything, mock.Anything).Return(udmrepo.ID("snap-001"), nil)
+				repo.On("Flush", mock.Anything).Return(nil)
+			},
+			checkInfo: func(t *testing.T, info uploader.SnapshotInfo) {
+				t.Helper()
+				assert.Equal(t, "snap-001", info.ID)
+			},
+		},
 	}
 
 	for _, tc := range testCases {
@@ -184,6 +204,7 @@ func TestSnapshotSource(t *testing.T) {
 		expectedErrStr string
 		expectedSnapID string
 		expectedSize   int64
+		cbtService     func(t *testing.T) cbtservice.Service
 	}{
 		{
 			name: "uploader Backup error",
@@ -216,7 +237,10 @@ func TestSnapshotSource(t *testing.T) {
 		{
 			name: "success with nil cbtService falls back to full bitmap",
 			setupMocks: func(blkup *mockUploader, repo *udmrepomocks.BackupRepo) {
-				blkup.On("Backup", mock.Anything, mock.Anything, mock.Anything, mock.Anything).
+				blkup.On("Backup", mock.Anything, mock.Anything, mock.MatchedBy(func(iter cbttypes.Iterator) bool {
+					// In full mode, the iterator should cover the whole range if it's a full backup
+					return iter != nil
+				}), mock.Anything).
 					Return(udmrepo.Snapshot{RootObject: udmrepo.ObjectMetadata{ID: "root"}}, int64(512), nil)
 				repo.On("SaveSnapshot", mock.Anything, mock.Anything).Return(udmrepo.ID("snap-success"), nil)
 				repo.On("Flush", mock.Anything).Return(nil)
@@ -239,6 +263,46 @@ func TestSnapshotSource(t *testing.T) {
 			},
 			expectedSnapID: "snap-tags",
 		},
+		{
+			name: "success with cbtService getting allocated blocks",
+			cbtService: func(t *testing.T) cbtservice.Service {
+				t.Helper()
+				m := cbtservicemocks.NewService(t)
+				m.On("GetAllocatedBlocks", mock.Anything, "snap-1", mock.Anything).
+					Run(func(args mock.Arguments) {
+						record := args.Get(2).(func([]cbtservice.Range) error)
+						record([]cbtservice.Range{{Offset: 0, Length: 1024}})
+					}).Return(nil)
+				return m
+			},
+			setupMocks: func(blkup *mockUploader, repo *udmrepomocks.BackupRepo) {
+				blkup.On("Backup", mock.Anything, mock.Anything, mock.Anything, mock.Anything).
+					Return(udmrepo.Snapshot{RootObject: udmrepo.ObjectMetadata{ID: "root"}}, int64(1024), nil)
+				repo.On("SaveSnapshot", mock.Anything, mock.Anything).Return(udmrepo.ID("snap-cbt-alloc"), nil)
+				repo.On("Flush", mock.Anything).Return(nil)
+			},
+			expectedSnapID: "snap-cbt-alloc",
+			expectedSize:   1024,
+		},
+		{
+			name: "cbtService error falls back to full",
+			cbtService: func(t *testing.T) cbtservice.Service {
+				t.Helper()
+				m := cbtservicemocks.NewService(t)
+				m.On("GetAllocatedBlocks", mock.Anything, "snap-1", mock.Anything).
+					Return(errors.New("CBT error"))
+				return m
+			},
+			setupMocks: func(blkup *mockUploader, repo *udmrepomocks.BackupRepo) {
+				// Should be called with parentObject as empty because of fallback
+				blkup.On("Backup", mock.Anything, udmrepo.ID(""), mock.Anything, mock.Anything).
+					Return(udmrepo.Snapshot{}, int64(2048), nil)
+				repo.On("SaveSnapshot", mock.Anything, mock.Anything).Return(udmrepo.ID("snap-cbt-fallback"), nil)
+				repo.On("Flush", mock.Anything).Return(nil)
+			},
+			expectedSnapID: "snap-cbt-fallback",
+			expectedSize:   2048,
+		},
 	}
 
 	for _, tc := range testCases {
@@ -249,14 +313,19 @@ func TestSnapshotSource(t *testing.T) {
 
 			tc.setupMocks(mockBlkup, mockRepo)
 
-			cbtSrc := cbtservice.SourceInfo{ChangeID: "cid-1", VolumeID: "vid-1"}
+			cbtSrc := cbtservice.SourceInfo{Snapshot: "snap-1", ChangeID: "cid-1", VolumeID: "vid-1"}
 			snapshotTags := map[string]string{"custom": "val"}
+
+			var cbtSvc cbtservice.Service
+			if tc.cbtService != nil {
+				cbtSvc = tc.cbtService(t)
+			}
 
 			snapID, size, err := snapshotSource(
 				ctx, mockRepo, mockBlkup,
 				baseSource,
 				true, "",
-				cbtSrc, nil,
+				cbtSrc, cbtSvc,
 				snapshotTags, map[string]string{},
 				testLog(), "Block Uploader",
 			)
@@ -273,6 +342,58 @@ func TestSnapshotSource(t *testing.T) {
 			mockBlkup.AssertExpectations(t)
 		})
 	}
+}
+
+// TestGetParentBackupInfoLogsDiscoveredParentID pins that the parent-selection messages
+// name the snapshot they are about. On the discovery branch the parentSnapshot parameter
+// is empty by definition, so logging it there emits "Using parent snapshot , start time ..."
+// - a decision logged without the identifier needed to act on it.
+func TestGetParentBackupInfoLogsDiscoveredParentID(t *testing.T) {
+	const volumeID = "vol-123"
+	const realSource = "/test/source"
+	const rootObj = "root-obj-42"
+
+	snapshotTags := map[string]string{
+		uploader.SnapshotRequesterTag: "test-requester",
+		uploader.SnapshotUploaderTag:  uploader.BlockType,
+	}
+
+	logger, hook := logrustest.NewNullLogger()
+	logger.SetLevel(logrus.DebugLevel)
+
+	repo := udmrepomocks.NewBackupRepo(t)
+	repo.On("ListSnapshot", mock.Anything, realSource).
+		Return([]udmrepo.Snapshot{{
+			RootObject: udmrepo.ObjectMetadata{ID: rootObj},
+			Tags: map[string]string{
+				uploader.CBTChangeIDTag:       "cid-abc",
+				uploader.CBTVolumeIDTag:       volumeID,
+				uploader.SnapshotRequesterTag: "test-requester",
+				uploader.SnapshotUploaderTag:  uploader.BlockType,
+			},
+		}}, nil)
+	repo.On("ReadMetadata", mock.Anything, udmrepo.ID(rootObj)).
+		Return(&udmrepo.Metadata{
+			SubObjects: []udmrepo.ObjectMetadata{{ID: udmrepo.ID("parent-obj")}},
+		}, nil)
+
+	info := getParentBackupInfo(
+		context.Background(), repo,
+		false, "", // no explicit parent -> discovery branch
+		volumeID, realSource, snapshotTags, logger,
+	)
+
+	require.Equal(t, udmrepo.ID("parent-obj"), info.parentObject)
+
+	var found bool
+	for _, entry := range hook.AllEntries() {
+		if strings.HasPrefix(entry.Message, "Using parent snapshot ") {
+			found = true
+			assert.Contains(t, entry.Message, rootObj,
+				"parent-selection message must name the discovered snapshot, got %q", entry.Message)
+		}
+	}
+	require.True(t, found, "expected a \"Using parent snapshot\" message")
 }
 
 func TestGetParentBackupInfo(t *testing.T) {
@@ -547,6 +668,9 @@ func TestRestore(t *testing.T) {
 
 	testCases := []struct {
 		name           string
+		incremental    bool
+		cbtSource      cbtservice.SourceInfo
+		cbtService     func(t *testing.T) cbtservice.Service
 		setupMocks     func(blkup *mockUploader, repo *udmrepomocks.BackupRepo)
 		setupOpenDev   func(t *testing.T) *os.File
 		expectedErrStr string
@@ -583,7 +707,7 @@ func TestRestore(t *testing.T) {
 			expectedErrStr: "error restoring to block dev",
 		},
 		{
-			name: "success returns size",
+			name: "success returns size (full restore)",
 			setupMocks: func(blkup *mockUploader, repo *udmrepomocks.BackupRepo) {
 				repo.On("GetSnapshot", mock.Anything, udmrepo.ID("snap-001")).
 					Return(storedSnap, nil)
@@ -595,6 +719,102 @@ func TestRestore(t *testing.T) {
 				return tempFile(t, "")
 			},
 			expectedSize: 4096,
+		},
+		{
+			name:        "incremental restore success",
+			incremental: true,
+			cbtSource:   cbtservice.SourceInfo{Snapshot: "snap-cbt", VolumeID: "vol-1"},
+			cbtService: func(t *testing.T) cbtservice.Service {
+				t.Helper()
+				m := cbtservicemocks.NewService(t)
+				m.On("GetChangedBlocks", mock.Anything, "snap-cbt", "cid-1", mock.Anything).
+					Run(func(args mock.Arguments) {
+						record := args.Get(3).(func([]cbtservice.Range) error)
+						record([]cbtservice.Range{{Offset: 0, Length: 512}})
+					}).Return(nil)
+				return m
+			},
+			setupMocks: func(blkup *mockUploader, repo *udmrepomocks.BackupRepo) {
+				snapWithTags := udmrepo.Snapshot{
+					Tags: map[string]string{
+						uploader.CBTChangeIDTag: "cid-1",
+						uploader.CBTVolumeIDTag: "vol-1",
+					},
+					TotalSize: 1024,
+				}
+				repo.On("GetSnapshot", mock.Anything, udmrepo.ID("snap-001")).Return(snapWithTags, nil)
+				blkup.On("Restore", mock.Anything, mock.Anything, mock.Anything, mock.Anything).
+					Return(int64(512), int64(512), nil)
+			},
+			setupOpenDev: func(t *testing.T) *os.File {
+				t.Helper()
+				return tempFile(t, "")
+			},
+			expectedSize: 512,
+		},
+		{
+			name:        "incremental restore fallback - missing tags",
+			incremental: true,
+			setupMocks: func(blkup *mockUploader, repo *udmrepomocks.BackupRepo) {
+				repo.On("GetSnapshot", mock.Anything, udmrepo.ID("snap-001")).Return(storedSnap, nil)
+				blkup.On("Restore", mock.Anything, mock.Anything, mock.Anything, mock.Anything).
+					Return(int64(4096), int64(4096), nil)
+			},
+			setupOpenDev: func(t *testing.T) *os.File {
+				t.Helper()
+				return tempFile(t, "")
+			},
+			expectedSize: 4096,
+		},
+		{
+			name:        "incremental restore fallback - VolumeID mismatch",
+			incremental: true,
+			cbtSource:   cbtservice.SourceInfo{VolumeID: "vol-actual"},
+			setupMocks: func(blkup *mockUploader, repo *udmrepomocks.BackupRepo) {
+				snapWithTags := udmrepo.Snapshot{
+					Tags: map[string]string{
+						uploader.CBTChangeIDTag: "cid-1",
+						uploader.CBTVolumeIDTag: "vol-expected",
+					},
+				}
+				repo.On("GetSnapshot", mock.Anything, udmrepo.ID("snap-001")).Return(snapWithTags, nil)
+				blkup.On("Restore", mock.Anything, mock.Anything, mock.Anything, mock.Anything).
+					Return(int64(4096), int64(4096), nil)
+			},
+			setupOpenDev: func(t *testing.T) *os.File {
+				t.Helper()
+				return tempFile(t, "")
+			},
+			expectedSize: 4096,
+		},
+		{
+			name:        "incremental restore fallback - CBT service error",
+			incremental: true,
+			cbtSource:   cbtservice.SourceInfo{Snapshot: "snap-cbt", VolumeID: "vol-1"},
+			cbtService: func(t *testing.T) cbtservice.Service {
+				t.Helper()
+				m := cbtservicemocks.NewService(t)
+				m.On("GetChangedBlocks", mock.Anything, "snap-cbt", "cid-1", mock.Anything).
+					Return(errors.New("CBT error"))
+				return m
+			},
+			setupMocks: func(blkup *mockUploader, repo *udmrepomocks.BackupRepo) {
+				snapWithTags := udmrepo.Snapshot{
+					Tags: map[string]string{
+						uploader.CBTChangeIDTag: "cid-1",
+						uploader.CBTVolumeIDTag: "vol-1",
+					},
+					TotalSize: 1024,
+				}
+				repo.On("GetSnapshot", mock.Anything, udmrepo.ID("snap-001")).Return(snapWithTags, nil)
+				blkup.On("Restore", mock.Anything, mock.Anything, mock.Anything, mock.Anything).
+					Return(int64(1024), int64(1024), nil)
+			},
+			setupOpenDev: func(t *testing.T) *os.File {
+				t.Helper()
+				return tempFile(t, "")
+			},
+			expectedSize: 1024,
 		},
 	}
 
@@ -617,7 +837,12 @@ func TestRestore(t *testing.T) {
 				}
 			}
 
-			size, err := Restore(ctx, mockBlkup, mockRepo, "snap-001", "/dev/sdb", map[string]string{}, testLog())
+			var cbtSvc cbtservice.Service
+			if tc.cbtService != nil {
+				cbtSvc = tc.cbtService(t)
+			}
+
+			size, err := Restore(ctx, mockBlkup, mockRepo, "snap-001", "/dev/sdb", tc.incremental, tc.cbtSource, cbtSvc, map[string]string{}, testLog())
 
 			if tc.expectedErrStr != "" {
 				require.Error(t, err)
