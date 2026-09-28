@@ -19,6 +19,7 @@ package controller
 import (
 	"context"
 	"fmt"
+	"strconv"
 	"time"
 
 	"github.com/cockroachdb/errors"
@@ -181,10 +182,13 @@ func (c *scheduleReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 func parseCronSchedule(itm *velerov1.Schedule, logger logrus.FieldLogger) (cron.Schedule, []string) {
 	var validationErrors []string
 	var schedule cron.Schedule
+	validationError := func(reason any) string {
+		return fmt.Sprintf("invalid spec.schedule %q: %v. Expected a non-empty 5-field cron expression (minute hour day-of-month month day-of-week), e.g. \"0 2 * * *\" or \"0 2 * * MON-FRI\", or a supported shortcut, e.g. \"@daily\" or \"@every 5m\"", itm.Spec.Schedule, reason)
+	}
 
 	// cron.Parse panics if schedule is empty
 	if len(itm.Spec.Schedule) == 0 {
-		validationErrors = append(validationErrors, "Schedule must be a non-empty valid Cron expression")
+		validationErrors = append(validationErrors, validationError("schedule is empty"))
 		return nil, validationErrors
 	}
 
@@ -199,13 +203,21 @@ func parseCronSchedule(itm *velerov1.Schedule, logger logrus.FieldLogger) (cron.
 					"schedule": itm.Spec.Schedule,
 					"recover":  r,
 				}).Debug("Panic parsing schedule")
-				validationErrors = append(validationErrors, fmt.Sprintf("invalid schedule: %v", r))
+				validationErrors = append(validationErrors, validationError(r))
 			}
 		}()
 
 		if res, err := cron.ParseStandard(itm.Spec.Schedule); err != nil {
 			log.WithError(errors.WithStack(err)).WithField("schedule", itm.Spec.Schedule).Debug("Error parsing schedule")
-			validationErrors = append(validationErrors, fmt.Sprintf("invalid schedule: %v", err))
+			var numErr *strconv.NumError
+			if errors.As(err, &numErr) {
+				if errors.Is(numErr.Err, strconv.ErrRange) {
+					err = fmt.Errorf("numeric value %q is too large for a cron field", numErr.Num)
+				} else {
+					err = fmt.Errorf("could not parse %q as a valid cron field value", numErr.Num)
+				}
+			}
+			validationErrors = append(validationErrors, validationError(err))
 		} else {
 			schedule = res
 		}
