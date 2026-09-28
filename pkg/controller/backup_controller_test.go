@@ -31,6 +31,7 @@ import (
 	"github.com/google/go-cmp/cmp"
 	"github.com/google/go-cmp/cmp/cmpopts"
 	snapshotv1api "github.com/kubernetes-csi/external-snapshotter/client/v8/apis/volumesnapshot/v1"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/sirupsen/logrus"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
@@ -63,6 +64,7 @@ import (
 	ibav1 "github.com/vmware-tanzu/velero/pkg/plugin/velero/itemblockaction/v1"
 	velerotest "github.com/vmware-tanzu/velero/pkg/test"
 	"github.com/vmware-tanzu/velero/pkg/util/boolptr"
+	"github.com/vmware-tanzu/velero/pkg/util/datamover"
 	kubeutil "github.com/vmware-tanzu/velero/pkg/util/kube"
 	"github.com/vmware-tanzu/velero/pkg/util/logging"
 )
@@ -352,6 +354,417 @@ func TestPrepareBackupRequest_EmptyIncludedNamespacesNormalizedToWildcard(t *tes
 	assert.Equal(t, []string{"*"}, res.Spec.IncludedNamespaces)
 }
 
+// TestPrepareBackupRequest_IncludedNamespacesByLabel_ReplacesWildcardBaseline verifies that
+// when includedNamespacesByLabel is configured and BackupSpec.IncludedNamespaces was left
+// empty (normalized to the ["*"] wildcard), the label-resolved namespace set REPLACES the
+// wildcard baseline rather than being unioned into it - otherwise "all" unioned with anything
+// is still "all", defeating the feature.
+func TestPrepareBackupRequest_IncludedNamespacesByLabel_ReplacesWildcardBaseline(t *testing.T) {
+	formatFlag := logging.FormatText
+	logger := logging.DefaultLogger(logrus.DebugLevel, formatFlag)
+
+	policyYAML := `version: v1
+includeExcludePolicy:
+  includedNamespacesByLabel:
+  - "team=platform"
+`
+	policyConfigMap := &corev1api.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Name: "ns-label-policy", Namespace: velerov1api.DefaultNamespace},
+		Data:       map[string]string{"policy": policyYAML},
+	}
+
+	backupLocation := builder.ForBackupStorageLocation("velero", "loc-1").Phase(velerov1api.BackupStorageLocationPhaseAvailable).Result()
+	nsPlatform := builder.ForNamespace("platform-ns").ObjectMeta(builder.WithLabels("team", "platform")).Result()
+	nsOther := builder.ForNamespace("other-ns").ObjectMeta(builder.WithLabels("team", "infra")).Result()
+
+	fakeClient := velerotest.NewFakeControllerRuntimeClient(t, policyConfigMap, backupLocation, nsPlatform, nsOther)
+
+	apiServer := velerotest.NewAPIServer(t)
+	discoveryHelper, err := discovery.NewHelper(apiServer.DiscoveryClient, logger)
+	require.NoError(t, err)
+
+	c := &backupReconciler{
+		discoveryHelper:       discoveryHelper,
+		kbClient:              fakeClient,
+		defaultBackupLocation: backupLocation.Name,
+		clock:                 &clock.RealClock{},
+		formatFlag:            formatFlag,
+	}
+
+	backup := defaultBackup().Result()
+	backup.Spec.IncludedNamespaces = nil
+	backup.Spec.ResourcePolicy = &corev1api.TypedLocalObjectReference{Kind: "configmap", Name: "ns-label-policy"}
+
+	res := c.prepareBackupRequest(ctx, backup, logger)
+	defer res.WorkerPool.Stop()
+
+	assert.Empty(t, res.Status.ValidationErrors)
+	assert.Equal(t, []string{"platform-ns"}, res.Spec.IncludedNamespaces)
+}
+
+// TestPrepareBackupRequest_IncludedNamespacesByLabel_UnionsWithExplicitIncludes verifies that
+// when BackupSpec.IncludedNamespaces already has explicit names, the label-resolved set is
+// additive (unioned), not a replacement.
+func TestPrepareBackupRequest_IncludedNamespacesByLabel_UnionsWithExplicitIncludes(t *testing.T) {
+	formatFlag := logging.FormatText
+	logger := logging.DefaultLogger(logrus.DebugLevel, formatFlag)
+
+	policyYAML := `version: v1
+includeExcludePolicy:
+  includedNamespacesByLabel:
+  - "team=platform"
+`
+	policyConfigMap := &corev1api.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Name: "ns-label-policy", Namespace: velerov1api.DefaultNamespace},
+		Data:       map[string]string{"policy": policyYAML},
+	}
+
+	backupLocation := builder.ForBackupStorageLocation("velero", "loc-1").Phase(velerov1api.BackupStorageLocationPhaseAvailable).Result()
+	nsPlatform := builder.ForNamespace("platform-ns").ObjectMeta(builder.WithLabels("team", "platform")).Result()
+
+	fakeClient := velerotest.NewFakeControllerRuntimeClient(t, policyConfigMap, backupLocation, nsPlatform)
+
+	apiServer := velerotest.NewAPIServer(t)
+	discoveryHelper, err := discovery.NewHelper(apiServer.DiscoveryClient, logger)
+	require.NoError(t, err)
+
+	c := &backupReconciler{
+		discoveryHelper:       discoveryHelper,
+		kbClient:              fakeClient,
+		defaultBackupLocation: backupLocation.Name,
+		clock:                 &clock.RealClock{},
+		formatFlag:            formatFlag,
+	}
+
+	backup := defaultBackup().IncludedNamespaces("explicit-ns").Result()
+	backup.Spec.ResourcePolicy = &corev1api.TypedLocalObjectReference{Kind: "configmap", Name: "ns-label-policy"}
+
+	res := c.prepareBackupRequest(ctx, backup, logger)
+	defer res.WorkerPool.Stop()
+
+	assert.Empty(t, res.Status.ValidationErrors)
+	assert.ElementsMatch(t, []string{"explicit-ns", "platform-ns"}, res.Spec.IncludedNamespaces)
+}
+
+// TestPrepareBackupRequest_IncludedNamespacesByLabel_ZeroMatchesResolvesToNoMatchSentinel
+// verifies that a configured includedNamespacesByLabel selector matching zero namespaces
+// resolves to resourcepolicies.NoNamespaceMatchesPattern, not a fall-through to "all
+// namespaces" - this is deliberate fail-safe behavior, not a bug.
+func TestPrepareBackupRequest_IncludedNamespacesByLabel_ZeroMatchesResolvesToNoMatchSentinel(t *testing.T) {
+	formatFlag := logging.FormatText
+	logger := logging.DefaultLogger(logrus.DebugLevel, formatFlag)
+
+	policyYAML := `version: v1
+includeExcludePolicy:
+  includedNamespacesByLabel:
+  - "team=nonexistent"
+`
+	policyConfigMap := &corev1api.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Name: "ns-label-policy", Namespace: velerov1api.DefaultNamespace},
+		Data:       map[string]string{"policy": policyYAML},
+	}
+
+	backupLocation := builder.ForBackupStorageLocation("velero", "loc-1").Phase(velerov1api.BackupStorageLocationPhaseAvailable).Result()
+	nsOther := builder.ForNamespace("other-ns").ObjectMeta(builder.WithLabels("team", "infra")).Result()
+
+	fakeClient := velerotest.NewFakeControllerRuntimeClient(t, policyConfigMap, backupLocation, nsOther)
+
+	apiServer := velerotest.NewAPIServer(t)
+	discoveryHelper, err := discovery.NewHelper(apiServer.DiscoveryClient, logger)
+	require.NoError(t, err)
+
+	c := &backupReconciler{
+		discoveryHelper:       discoveryHelper,
+		kbClient:              fakeClient,
+		defaultBackupLocation: backupLocation.Name,
+		clock:                 &clock.RealClock{},
+		formatFlag:            formatFlag,
+	}
+
+	backup := defaultBackup().Result()
+	backup.Spec.IncludedNamespaces = nil
+	backup.Spec.ResourcePolicy = &corev1api.TypedLocalObjectReference{Kind: "configmap", Name: "ns-label-policy"}
+
+	res := c.prepareBackupRequest(ctx, backup, logger)
+	defer res.WorkerPool.Stop()
+
+	assert.Empty(t, res.Status.ValidationErrors)
+	// Not a plain empty slice - see resourcepolicies.NoNamespaceMatchesPattern's doc comment
+	// for why a bare empty list here would be silently reinterpreted downstream as "include
+	// everything" instead of the intended "include nothing".
+	assert.Equal(t, []string{resourcepolicies.NoNamespaceMatchesPattern}, res.Spec.IncludedNamespaces)
+}
+
+// TestPrepareBackupRequest_IncludedNamespacesByLabel_ExplicitWildcardCanonicalized verifies
+// that when BackupSpec.IncludedNamespaces was explicitly set to ["*"] (as opposed to left
+// empty and normalized to ["*"]), includedNamespacesByLabel does not narrow the backup down
+// to only the label matches - the two must not be conflated (see mergeNamespacesByLabel's doc
+// comment). The result stays canonicalized to ["*"] rather than widened to ["*", "platform-ns"]:
+// both are equivalent at match time, but only the former satisfies
+// collections.ValidateIncludesExcludes' "'*' must be alone in includes" invariant.
+func TestPrepareBackupRequest_IncludedNamespacesByLabel_ExplicitWildcardCanonicalized(t *testing.T) {
+	formatFlag := logging.FormatText
+	logger := logging.DefaultLogger(logrus.DebugLevel, formatFlag)
+
+	policyYAML := `version: v1
+includeExcludePolicy:
+  includedNamespacesByLabel:
+  - "team=platform"
+`
+	policyConfigMap := &corev1api.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Name: "ns-label-policy", Namespace: velerov1api.DefaultNamespace},
+		Data:       map[string]string{"policy": policyYAML},
+	}
+
+	backupLocation := builder.ForBackupStorageLocation("velero", "loc-1").Phase(velerov1api.BackupStorageLocationPhaseAvailable).Result()
+	nsPlatform := builder.ForNamespace("platform-ns").ObjectMeta(builder.WithLabels("team", "platform")).Result()
+
+	fakeClient := velerotest.NewFakeControllerRuntimeClient(t, policyConfigMap, backupLocation, nsPlatform)
+
+	apiServer := velerotest.NewAPIServer(t)
+	discoveryHelper, err := discovery.NewHelper(apiServer.DiscoveryClient, logger)
+	require.NoError(t, err)
+
+	c := &backupReconciler{
+		discoveryHelper:       discoveryHelper,
+		kbClient:              fakeClient,
+		defaultBackupLocation: backupLocation.Name,
+		clock:                 &clock.RealClock{},
+		formatFlag:            formatFlag,
+	}
+
+	backup := defaultBackup().IncludedNamespaces("*").Result()
+	backup.Spec.ResourcePolicy = &corev1api.TypedLocalObjectReference{Kind: "configmap", Name: "ns-label-policy"}
+
+	res := c.prepareBackupRequest(ctx, backup, logger)
+	defer res.WorkerPool.Stop()
+
+	assert.Empty(t, res.Status.ValidationErrors)
+	assert.ElementsMatch(t, []string{"*"}, res.Spec.IncludedNamespaces)
+}
+
+// TestPrepareBackupRequest_ExcludedNamespacesByLabel_Subtracted verifies excludedNamespacesByLabel
+// resolves independently and is merged into BackupSpec.ExcludedNamespaces, regardless of whether
+// includedNamespacesByLabel is configured.
+func TestPrepareBackupRequest_ExcludedNamespacesByLabel_Subtracted(t *testing.T) {
+	formatFlag := logging.FormatText
+	logger := logging.DefaultLogger(logrus.DebugLevel, formatFlag)
+
+	policyYAML := `version: v1
+includeExcludePolicy:
+  excludedNamespacesByLabel:
+  - "confidential=true"
+`
+	policyConfigMap := &corev1api.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Name: "ns-label-policy", Namespace: velerov1api.DefaultNamespace},
+		Data:       map[string]string{"policy": policyYAML},
+	}
+
+	backupLocation := builder.ForBackupStorageLocation("velero", "loc-1").Phase(velerov1api.BackupStorageLocationPhaseAvailable).Result()
+	nsConfidential := builder.ForNamespace("secret-ns").ObjectMeta(builder.WithLabels("confidential", "true")).Result()
+
+	fakeClient := velerotest.NewFakeControllerRuntimeClient(t, policyConfigMap, backupLocation, nsConfidential)
+
+	apiServer := velerotest.NewAPIServer(t)
+	discoveryHelper, err := discovery.NewHelper(apiServer.DiscoveryClient, logger)
+	require.NoError(t, err)
+
+	c := &backupReconciler{
+		discoveryHelper:       discoveryHelper,
+		kbClient:              fakeClient,
+		defaultBackupLocation: backupLocation.Name,
+		clock:                 &clock.RealClock{},
+		formatFlag:            formatFlag,
+	}
+
+	backup := defaultBackup().Result()
+	backup.Spec.IncludedNamespaces = nil
+	backup.Spec.ResourcePolicy = &corev1api.TypedLocalObjectReference{Kind: "configmap", Name: "ns-label-policy"}
+
+	res := c.prepareBackupRequest(ctx, backup, logger)
+	defer res.WorkerPool.Stop()
+
+	assert.Empty(t, res.Status.ValidationErrors)
+	// includedNamespacesByLabel not configured, so baseline stays the wildcard.
+	assert.Equal(t, []string{"*"}, res.Spec.IncludedNamespaces)
+	assert.Equal(t, []string{"secret-ns"}, res.Spec.ExcludedNamespaces)
+}
+
+// TestMergeNamespacesByLabel exercises the union/replacement decision directly, without
+// the full prepareBackupRequest scaffold (fake client, discovery helper, resource policy
+// ConfigMap, etc.) - see mergeNamespacesByLabel's doc comment for the precedence rules.
+func TestMergeNamespacesByLabel(t *testing.T) {
+	tests := []struct {
+		name                            string
+		includedNamespaces              []string
+		excludedNamespaces              []string
+		labelIncludeActive              bool
+		includedNamespacesWereDefaulted bool
+		resolvedIncluded                []string
+		resolvedExcluded                []string
+		wantIncluded                    []string
+		wantExcluded                    []string
+	}{
+		{
+			name:                            "defaulted wildcard baseline is replaced",
+			includedNamespaces:              []string{"*"},
+			labelIncludeActive:              true,
+			includedNamespacesWereDefaulted: true,
+			resolvedIncluded:                []string{"platform-ns"},
+			wantIncluded:                    []string{"platform-ns"},
+			wantExcluded:                    nil,
+		},
+		{
+			name:                            "explicit includes union additively",
+			includedNamespaces:              []string{"explicit-ns"},
+			labelIncludeActive:              true,
+			includedNamespacesWereDefaulted: false,
+			resolvedIncluded:                []string{"platform-ns"},
+			wantIncluded:                    []string{"explicit-ns", "platform-ns"},
+			wantExcluded:                    nil,
+		},
+		{
+			// Explicit includes can themselves be a non-"*" wildcard glob (e.g. from
+			// --include-namespaces 'app-*'), not just concrete names - the union branch must
+			// pass that through unchanged alongside the resolved concrete names; downstream
+			// wildcard.ShouldExpandWildcards still expands it normally since it isn't the bare
+			// "*" special case.
+			name:                            "explicit glob-pattern include unions with resolved names unchanged",
+			includedNamespaces:              []string{"app-*"},
+			labelIncludeActive:              true,
+			includedNamespacesWereDefaulted: false,
+			resolvedIncluded:                []string{"platform-ns"},
+			wantIncluded:                    []string{"app-*", "platform-ns"},
+			wantExcluded:                    nil,
+		},
+		{
+			// A bare empty []string here would be interpreted downstream by
+			// wildcard.ShouldExpandWildcards as "match everything" (its own documented
+			// behavior), silently defeating the fail-safe. Must come back as
+			// resourcepolicies.NoNamespaceMatchesPattern instead - see
+			// mergeNamespacesByLabel's doc comment.
+			name:                            "defaulted wildcard matching zero namespaces resolves to the no-match sentinel, not empty",
+			includedNamespaces:              []string{"*"},
+			labelIncludeActive:              true,
+			includedNamespacesWereDefaulted: true,
+			resolvedIncluded:                nil,
+			wantIncluded:                    []string{resourcepolicies.NoNamespaceMatchesPattern},
+			wantExcluded:                    nil,
+		},
+		{
+			// The code must not re-derive "was this defaulted" by checking
+			// includedNamespaces == ["*"], since an explicitly-configured wildcard looks
+			// identical to the normalized default by this point. An explicit ["*"] must stay
+			// "everything", never narrow to just the label matches - canonicalized back to
+			// ["*"] rather than widened to ["*", "platform-ns"], since the latter is
+			// semantically identical at match time but would violate
+			// collections.ValidateIncludesExcludes' "'*' must be alone in includes" invariant.
+			name:                            "explicitly-configured wildcard canonicalizes to itself instead of widening",
+			includedNamespaces:              []string{"*"},
+			labelIncludeActive:              true,
+			includedNamespacesWereDefaulted: false,
+			resolvedIncluded:                []string{"platform-ns"},
+			wantIncluded:                    []string{"*"},
+			wantExcluded:                    nil,
+		},
+		{
+			name:                            "explicitly-configured wildcard stays everything even on zero matches",
+			includedNamespaces:              []string{"*"},
+			labelIncludeActive:              true,
+			includedNamespacesWereDefaulted: false,
+			resolvedIncluded:                nil,
+			wantIncluded:                    []string{"*"},
+			wantExcluded:                    nil,
+		},
+		{
+			name:                            "not labelIncludeActive leaves includedNamespaces untouched",
+			includedNamespaces:              []string{"*"},
+			labelIncludeActive:              false,
+			includedNamespacesWereDefaulted: true,
+			resolvedIncluded:                []string{"platform-ns"}, // should be ignored
+			wantIncluded:                    []string{"*"},
+			wantExcluded:                    nil,
+		},
+		{
+			name:                            "resolvedExcluded unions in regardless of labelIncludeActive",
+			includedNamespaces:              []string{"*"},
+			excludedNamespaces:              []string{"legacy-ns"},
+			labelIncludeActive:              false,
+			includedNamespacesWereDefaulted: true,
+			resolvedExcluded:                []string{"secret-ns"},
+			wantIncluded:                    []string{"*"},
+			wantExcluded:                    []string{"legacy-ns", "secret-ns"},
+		},
+		{
+			name:                            "empty resolvedExcluded leaves excludedNamespaces untouched",
+			includedNamespaces:              []string{"*"},
+			excludedNamespaces:              []string{"legacy-ns"},
+			labelIncludeActive:              false,
+			includedNamespacesWereDefaulted: true,
+			resolvedExcluded:                nil,
+			wantIncluded:                    []string{"*"},
+			wantExcluded:                    []string{"legacy-ns"},
+		},
+		{
+			// A resolved-include name overlapping an already-excluded name violates
+			// collections.ValidateIncludesExcludes' "excludes list cannot contain an item in
+			// the includes list" invariant if the merged result were ever re-validated.
+			// Exclusion already wins at match time regardless (IncludesExcludes.ShouldInclude
+			// checks excludes first), so dropping the overlap from mergedIncluded changes only
+			// the returned representation, not resolved backup behavior.
+			name:                            "a resolved include overlapping an existing exclude is dropped from the merged includes",
+			includedNamespaces:              []string{"explicit-ns"},
+			excludedNamespaces:              []string{"both-ns"},
+			labelIncludeActive:              true,
+			includedNamespacesWereDefaulted: false,
+			resolvedIncluded:                []string{"both-ns", "platform-ns"},
+			wantIncluded:                    []string{"explicit-ns", "platform-ns"},
+			wantExcluded:                    []string{"both-ns"},
+		},
+		{
+			// The exclude-subtraction step itself can produce a bare empty []string when
+			// every explicit include is also excluded - the same "empty means include
+			// everything" hazard the zero-match sentinel exists for, reached through a
+			// different path.
+			name:                            "an explicit include fully removed by exclusion resolves to the no-match sentinel, not empty",
+			includedNamespaces:              []string{"explicit-ns"},
+			labelIncludeActive:              true,
+			includedNamespacesWereDefaulted: false,
+			resolvedExcluded:                []string{"explicit-ns"},
+			wantIncluded:                    []string{resourcepolicies.NoNamespaceMatchesPattern},
+			wantExcluded:                    []string{"explicit-ns"},
+		},
+		{
+			// Same hazard, but for a defaulted-wildcard-replaced resolved include (rather
+			// than an explicit one) that a same-namespace excludedNamespacesByLabel match
+			// fully removes.
+			name:                            "a resolved include fully removed by exclusion resolves to the no-match sentinel, not empty",
+			includedNamespaces:              []string{"*"},
+			labelIncludeActive:              true,
+			includedNamespacesWereDefaulted: true,
+			resolvedIncluded:                []string{"both-ns"},
+			resolvedExcluded:                []string{"both-ns"},
+			wantIncluded:                    []string{resourcepolicies.NoNamespaceMatchesPattern},
+			wantExcluded:                    []string{"both-ns"},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			gotIncluded, gotExcluded := mergeNamespacesByLabel(
+				tc.includedNamespaces,
+				tc.excludedNamespaces,
+				tc.labelIncludeActive,
+				tc.includedNamespacesWereDefaulted,
+				tc.resolvedIncluded,
+				tc.resolvedExcluded,
+			)
+			assert.ElementsMatch(t, tc.wantIncluded, gotIncluded)
+			assert.ElementsMatch(t, tc.wantExcluded, gotExcluded)
+		})
+	}
+}
+
 func Test_prepareBackupRequest_BackupStorageLocation(t *testing.T) {
 	var (
 		defaultBackupTTL      = metav1.Duration{Duration: 24 * 30 * time.Hour}
@@ -520,6 +933,63 @@ func TestDefaultBackupTTL(t *testing.T) {
 			assert.NotNil(t, res)
 			assert.Equal(t, test.expectedTTL, res.Spec.TTL)
 			assert.Equal(t, test.expectedExpiration, *res.Status.Expiration)
+		})
+	}
+}
+
+func TestPrepareBackupRequest_SetBackupType(t *testing.T) {
+	now, err := time.Parse(time.RFC1123Z, time.RFC1123Z)
+	require.NoError(t, err)
+	now = now.Local()
+
+	tests := []struct {
+		name               string
+		backup             *velerov1api.Backup
+		expectedBackupType velerov1api.BackupType
+	}{
+		{
+			name:               "default backup type is Incremental",
+			backup:             defaultBackup().Result(),
+			expectedBackupType: velerov1api.BackupTypeIncremental,
+		},
+		{
+			name:               "backup type is set to Full",
+			backup:             defaultBackup().BackupType(velerov1api.BackupTypeFull).Result(),
+			expectedBackupType: velerov1api.BackupTypeFull,
+		},
+		{
+			name:               "backup type is set to Incremental",
+			backup:             defaultBackup().BackupType(velerov1api.BackupTypeIncremental).Result(),
+			expectedBackupType: velerov1api.BackupTypeIncremental,
+		},
+	}
+
+	for _, test := range tests {
+		formatFlag := logging.FormatText
+		var (
+			fakeClient kbclient.Client
+			logger     = logging.DefaultLogger(logrus.DebugLevel, formatFlag)
+		)
+
+		t.Run(test.name, func(t *testing.T) {
+			apiServer := velerotest.NewAPIServer(t)
+			discoveryHelper, err := discovery.NewHelper(apiServer.DiscoveryClient, logger)
+			require.NoError(t, err)
+			// add the test's backup storage location if it's different than the default
+			fakeClient = velerotest.NewFakeControllerRuntimeClient(t)
+			c := &backupReconciler{
+				logger:          logger,
+				discoveryHelper: discoveryHelper,
+				kbClient:        fakeClient,
+				formatFlag:      formatFlag,
+				clock:           testclocks.NewFakeClock(now),
+			}
+
+			res := c.prepareBackupRequest(ctx, test.backup, logger)
+			defer res.WorkerPool.Stop()
+			assert.NotNil(t, res)
+
+			assert.Equal(t, test.expectedBackupType, res.Spec.BackupType)
 		})
 	}
 }
@@ -746,6 +1216,8 @@ func TestProcessBackupCompletions(t *testing.T) {
 					SnapshotMoveData:                 boolptr.False(),
 					ExcludedClusterScopedResources:   autoExcludeClusterScopedResources,
 					ExcludedNamespaceScopedResources: autoExcludeNamespaceScopedResources,
+					BackupType:                       velerov1api.BackupTypeIncremental,
+					DataMover:                        datamover.GetDefaultBuiltInDataMover(),
 				},
 				Status: velerov1api.BackupStatus{
 					Phase:          velerov1api.BackupPhaseFinalizing,
@@ -786,6 +1258,8 @@ func TestProcessBackupCompletions(t *testing.T) {
 					SnapshotMoveData:                 boolptr.False(),
 					ExcludedClusterScopedResources:   autoExcludeClusterScopedResources,
 					ExcludedNamespaceScopedResources: autoExcludeNamespaceScopedResources,
+					BackupType:                       velerov1api.BackupTypeIncremental,
+					DataMover:                        datamover.GetDefaultBuiltInDataMover(),
 				},
 				Status: velerov1api.BackupStatus{
 					Phase:          velerov1api.BackupPhaseFinalizing,
@@ -830,6 +1304,8 @@ func TestProcessBackupCompletions(t *testing.T) {
 					SnapshotMoveData:                 boolptr.False(),
 					ExcludedClusterScopedResources:   autoExcludeClusterScopedResources,
 					ExcludedNamespaceScopedResources: autoExcludeNamespaceScopedResources,
+					BackupType:                       velerov1api.BackupTypeIncremental,
+					DataMover:                        datamover.GetDefaultBuiltInDataMover(),
 				},
 				Status: velerov1api.BackupStatus{
 					Phase:          velerov1api.BackupPhaseFinalizing,
@@ -871,6 +1347,8 @@ func TestProcessBackupCompletions(t *testing.T) {
 					SnapshotMoveData:                 boolptr.False(),
 					ExcludedClusterScopedResources:   autoExcludeClusterScopedResources,
 					ExcludedNamespaceScopedResources: autoExcludeNamespaceScopedResources,
+					BackupType:                       velerov1api.BackupTypeIncremental,
+					DataMover:                        datamover.GetDefaultBuiltInDataMover(),
 				},
 				Status: velerov1api.BackupStatus{
 					Phase:          velerov1api.BackupPhaseFinalizing,
@@ -912,6 +1390,8 @@ func TestProcessBackupCompletions(t *testing.T) {
 					SnapshotMoveData:                 boolptr.False(),
 					ExcludedClusterScopedResources:   autoExcludeClusterScopedResources,
 					ExcludedNamespaceScopedResources: autoExcludeNamespaceScopedResources,
+					BackupType:                       velerov1api.BackupTypeIncremental,
+					DataMover:                        datamover.GetDefaultBuiltInDataMover(),
 				},
 				Status: velerov1api.BackupStatus{
 					Phase:          velerov1api.BackupPhaseFinalizing,
@@ -954,6 +1434,8 @@ func TestProcessBackupCompletions(t *testing.T) {
 					SnapshotMoveData:                 boolptr.False(),
 					ExcludedClusterScopedResources:   autoExcludeClusterScopedResources,
 					ExcludedNamespaceScopedResources: autoExcludeNamespaceScopedResources,
+					BackupType:                       velerov1api.BackupTypeIncremental,
+					DataMover:                        datamover.GetDefaultBuiltInDataMover(),
 				},
 				Status: velerov1api.BackupStatus{
 					Phase:          velerov1api.BackupPhaseFinalizing,
@@ -996,6 +1478,8 @@ func TestProcessBackupCompletions(t *testing.T) {
 					SnapshotMoveData:                 boolptr.False(),
 					ExcludedClusterScopedResources:   autoExcludeClusterScopedResources,
 					ExcludedNamespaceScopedResources: autoExcludeNamespaceScopedResources,
+					BackupType:                       velerov1api.BackupTypeIncremental,
+					DataMover:                        datamover.GetDefaultBuiltInDataMover(),
 				},
 				Status: velerov1api.BackupStatus{
 					Phase:          velerov1api.BackupPhaseFinalizing,
@@ -1038,6 +1522,8 @@ func TestProcessBackupCompletions(t *testing.T) {
 					SnapshotMoveData:                 boolptr.False(),
 					ExcludedClusterScopedResources:   autoExcludeClusterScopedResources,
 					ExcludedNamespaceScopedResources: autoExcludeNamespaceScopedResources,
+					BackupType:                       velerov1api.BackupTypeIncremental,
+					DataMover:                        datamover.GetDefaultBuiltInDataMover(),
 				},
 				Status: velerov1api.BackupStatus{
 					Phase:          velerov1api.BackupPhaseFinalizing,
@@ -1080,6 +1566,8 @@ func TestProcessBackupCompletions(t *testing.T) {
 					SnapshotMoveData:                 boolptr.False(),
 					ExcludedClusterScopedResources:   autoExcludeClusterScopedResources,
 					ExcludedNamespaceScopedResources: autoExcludeNamespaceScopedResources,
+					BackupType:                       velerov1api.BackupTypeIncremental,
+					DataMover:                        datamover.GetDefaultBuiltInDataMover(),
 				},
 				Status: velerov1api.BackupStatus{
 					Phase:          velerov1api.BackupPhaseFinalizing,
@@ -1123,10 +1611,12 @@ func TestProcessBackupCompletions(t *testing.T) {
 					SnapshotMoveData:                 boolptr.False(),
 					ExcludedClusterScopedResources:   autoExcludeClusterScopedResources,
 					ExcludedNamespaceScopedResources: autoExcludeNamespaceScopedResources,
+					BackupType:                       velerov1api.BackupTypeIncremental,
+					DataMover:                        datamover.GetDefaultBuiltInDataMover(),
 				},
 				Status: velerov1api.BackupStatus{
 					Phase:               velerov1api.BackupPhaseFailed,
-					FailureReason:       "backup already exists in object storage",
+					FailureReason:       "backup execution failed: backup already exists in object storage",
 					Version:             1,
 					FormatVersion:       "1.1.0",
 					StartTimestamp:      &timestamp,
@@ -1166,10 +1656,12 @@ func TestProcessBackupCompletions(t *testing.T) {
 					SnapshotMoveData:                 boolptr.False(),
 					ExcludedClusterScopedResources:   autoExcludeClusterScopedResources,
 					ExcludedNamespaceScopedResources: autoExcludeNamespaceScopedResources,
+					BackupType:                       velerov1api.BackupTypeIncremental,
+					DataMover:                        datamover.GetDefaultBuiltInDataMover(),
 				},
 				Status: velerov1api.BackupStatus{
 					Phase:               velerov1api.BackupPhaseFailed,
-					FailureReason:       "error checking if backup already exists in object storage: Backup already exists in object storage",
+					FailureReason:       "backup execution failed: error checking if backup already exists in object storage: Backup already exists in object storage",
 					Version:             1,
 					FormatVersion:       "1.1.0",
 					StartTimestamp:      &timestamp,
@@ -1209,6 +1701,8 @@ func TestProcessBackupCompletions(t *testing.T) {
 					SnapshotMoveData:                 boolptr.True(),
 					ExcludedClusterScopedResources:   autoExcludeClusterScopedResources,
 					ExcludedNamespaceScopedResources: autoExcludeNamespaceScopedResources,
+					BackupType:                       velerov1api.BackupTypeIncremental,
+					DataMover:                        datamover.GetDefaultBuiltInDataMover(),
 				},
 				Status: velerov1api.BackupStatus{
 					Phase:                       velerov1api.BackupPhaseFinalizing,
@@ -1253,6 +1747,8 @@ func TestProcessBackupCompletions(t *testing.T) {
 					SnapshotMoveData:                 boolptr.False(),
 					ExcludedClusterScopedResources:   autoExcludeClusterScopedResources,
 					ExcludedNamespaceScopedResources: autoExcludeNamespaceScopedResources,
+					BackupType:                       velerov1api.BackupTypeIncremental,
+					DataMover:                        datamover.GetDefaultBuiltInDataMover(),
 				},
 				Status: velerov1api.BackupStatus{
 					Phase:                       velerov1api.BackupPhaseFinalizing,
@@ -1297,6 +1793,8 @@ func TestProcessBackupCompletions(t *testing.T) {
 					SnapshotMoveData:                 boolptr.False(),
 					ExcludedClusterScopedResources:   autoExcludeClusterScopedResources,
 					ExcludedNamespaceScopedResources: autoExcludeNamespaceScopedResources,
+					BackupType:                       velerov1api.BackupTypeIncremental,
+					DataMover:                        datamover.GetDefaultBuiltInDataMover(),
 				},
 				Status: velerov1api.BackupStatus{
 					Phase:                       velerov1api.BackupPhaseFinalizing,
@@ -1341,6 +1839,8 @@ func TestProcessBackupCompletions(t *testing.T) {
 					SnapshotMoveData:                 boolptr.True(),
 					ExcludedClusterScopedResources:   autoExcludeClusterScopedResources,
 					ExcludedNamespaceScopedResources: autoExcludeNamespaceScopedResources,
+					BackupType:                       velerov1api.BackupTypeIncremental,
+					DataMover:                        datamover.GetDefaultBuiltInDataMover(),
 				},
 				Status: velerov1api.BackupStatus{
 					Phase:                       velerov1api.BackupPhaseFinalizing,
@@ -1386,6 +1886,8 @@ func TestProcessBackupCompletions(t *testing.T) {
 					SnapshotMoveData:                 boolptr.False(),
 					ExcludedClusterScopedResources:   autoExcludeClusterScopedResources,
 					ExcludedNamespaceScopedResources: autoExcludeNamespaceScopedResources,
+					BackupType:                       velerov1api.BackupTypeIncremental,
+					DataMover:                        datamover.GetDefaultBuiltInDataMover(),
 				},
 				Status: velerov1api.BackupStatus{
 					Phase:                       velerov1api.BackupPhaseFinalizing,
@@ -1430,6 +1932,8 @@ func TestProcessBackupCompletions(t *testing.T) {
 					SnapshotMoveData:                 boolptr.True(),
 					ExcludedClusterScopedResources:   autoExcludeClusterScopedResources,
 					ExcludedNamespaceScopedResources: autoExcludeNamespaceScopedResources,
+					BackupType:                       velerov1api.BackupTypeIncremental,
+					DataMover:                        datamover.GetDefaultBuiltInDataMover(),
 				},
 				Status: velerov1api.BackupStatus{
 					Phase:                       velerov1api.BackupPhaseFinalizing,
@@ -1480,6 +1984,8 @@ func TestProcessBackupCompletions(t *testing.T) {
 					ExcludedClusterScopedResources:   append([]string{"clusterroles"}, autoExcludeClusterScopedResources...),
 					IncludedNamespaceScopedResources: []string{"pods"},
 					ExcludedNamespaceScopedResources: append([]string{"secrets"}, autoExcludeNamespaceScopedResources...),
+					BackupType:                       velerov1api.BackupTypeIncremental,
+					DataMover:                        datamover.GetDefaultBuiltInDataMover(),
 				},
 				Status: velerov1api.BackupStatus{
 					Phase:                       velerov1api.BackupPhaseFinalizing,
@@ -1530,6 +2036,8 @@ func TestProcessBackupCompletions(t *testing.T) {
 					ExcludedClusterScopedResources:   append([]string{"clusterroles"}, autoExcludeClusterScopedResources...),
 					IncludedNamespaceScopedResources: []string{"pods"},
 					ExcludedNamespaceScopedResources: append([]string{"secrets"}, autoExcludeNamespaceScopedResources...),
+					BackupType:                       velerov1api.BackupTypeIncremental,
+					DataMover:                        datamover.GetDefaultBuiltInDataMover(),
 				},
 				Status: velerov1api.BackupStatus{
 					Phase:                       velerov1api.BackupPhaseFinalizing,
@@ -1965,6 +2473,48 @@ func Test_getLastSuccessBySchedule(t *testing.T) {
 	}
 }
 
+// Test_resyncBackupMetrics_prunesStaleTimestamps verifies that resyncBackupMetrics
+// removes backupLastSuccessfulTimestamp entries for schedules that no longer have
+// any completed backups (e.g. after the schedule and its backups are deleted).
+func Test_resyncBackupMetrics_prunesStaleTimestamps(t *testing.T) {
+	baseTime, err := time.Parse(time.RFC1123, time.RFC1123)
+	require.NoError(t, err)
+
+	m := metrics.NewServerMetrics()
+	gauge := m.Metrics()["backup_last_successful_timestamp"]
+
+	activeBackup := builder.ForBackup("velero", "b1").
+		ObjectMeta(builder.WithLabels(velerov1api.ScheduleNameLabel, "active-schedule")).
+		Phase(velerov1api.BackupPhaseCompleted).
+		CompletionTimestamp(baseTime).
+		Result()
+
+	deletedBackup := builder.ForBackup("velero", "b2").
+		ObjectMeta(builder.WithLabels(velerov1api.ScheduleNameLabel, "deleted-schedule")).
+		Phase(velerov1api.BackupPhaseCompleted).
+		CompletionTimestamp(baseTime).
+		Result()
+
+	fakeClient := velerotest.NewFakeControllerRuntimeClient(t, activeBackup, deletedBackup)
+
+	c := &backupReconciler{
+		kbClient: fakeClient,
+		logger:   logrus.StandardLogger(),
+		metrics:  m,
+	}
+
+	// First resync: sets metrics for both schedules
+	c.resyncBackupMetrics()
+	assert.Equal(t, 2, testutil.CollectAndCount(gauge))
+
+	// Simulate schedule deletion: remove the backup for "deleted-schedule"
+	require.NoError(t, fakeClient.Delete(t.Context(), deletedBackup))
+
+	// Second resync: prunes "deleted-schedule" metric, keeps "active-schedule"
+	c.resyncBackupMetrics()
+	assert.Equal(t, 1, testutil.CollectAndCount(gauge))
+}
+
 // Unit tests to make sure that the backup's status is updated correctly during reconcile.
 // To clear up confusion whether status can be updated with Patch alone without status writer and not kbClient.Status().Patch()
 func TestPatchResourceWorksWithStatus(t *testing.T) {
@@ -2348,6 +2898,123 @@ func TestPrepareBackupRequest_FilterPoliciesWithNewFilters(t *testing.T) {
 			} else {
 				assert.Nil(t, res.ResPolicies.GetClusterScopedFilterPolicy())
 			}
+		})
+	}
+}
+
+func TestPrepareBackupRequest_DeduplicateExcludedNamespaces(t *testing.T) {
+	tests := []struct {
+		name              string
+		specExcluded      []string
+		clusterNamespaces []*corev1api.Namespace
+		expectedExcluded  []string
+	}{
+		{
+			name:         "duplicates in spec.excludedNamespaces are de-duped",
+			specExcluded: []string{"ns-1", "ns-2", "ns-1", "ns-2", "ns-3"},
+			clusterNamespaces: []*corev1api.Namespace{
+				{
+					ObjectMeta: metav1.ObjectMeta{
+						Name: "ns-4",
+					},
+				},
+			},
+			expectedExcluded: []string{"ns-1", "ns-2", "ns-3"},
+		},
+		{
+			name:         "labeled namespaces overlapping with spec.excludedNamespaces are de-duped",
+			specExcluded: []string{"ns-1", "ns-2"},
+			clusterNamespaces: []*corev1api.Namespace{
+				{
+					ObjectMeta: metav1.ObjectMeta{
+						Name: "ns-2",
+						Labels: map[string]string{
+							velerov1api.ExcludeFromBackupLabel: "true",
+						},
+					},
+				},
+				{
+					ObjectMeta: metav1.ObjectMeta{
+						Name: "ns-3",
+						Labels: map[string]string{
+							velerov1api.ExcludeFromBackupLabel: "true",
+						},
+					},
+				},
+				{
+					ObjectMeta: metav1.ObjectMeta{
+						Name: "ns-4",
+					},
+				},
+			},
+			expectedExcluded: []string{"ns-1", "ns-2", "ns-3"},
+		},
+		{
+			name:         "empty spec.excludedNamespaces with labeled namespaces",
+			specExcluded: nil,
+			clusterNamespaces: []*corev1api.Namespace{
+				{
+					ObjectMeta: metav1.ObjectMeta{
+						Name: "ns-1",
+						Labels: map[string]string{
+							velerov1api.ExcludeFromBackupLabel: "true",
+						},
+					},
+				},
+				{
+					ObjectMeta: metav1.ObjectMeta{
+						Name: "ns-2",
+						Labels: map[string]string{
+							velerov1api.ExcludeFromBackupLabel: "true",
+						},
+					},
+				},
+			},
+			expectedExcluded: []string{"ns-1", "ns-2"},
+		},
+		{
+			name:              "empty spec.excludedNamespaces with no labeled namespaces remains empty",
+			specExcluded:      nil,
+			clusterNamespaces: nil,
+			expectedExcluded:  nil,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			formatFlag := logging.FormatText
+			logger := logging.DefaultLogger(logrus.DebugLevel, formatFlag)
+
+			backupLocation := builder.ForBackupStorageLocation(velerov1api.DefaultNamespace, "loc-1").
+				Phase(velerov1api.BackupStorageLocationPhaseAvailable).Result()
+
+			var objects []runtime.Object
+			objects = append(objects, backupLocation)
+			for _, ns := range tt.clusterNamespaces {
+				objects = append(objects, ns)
+			}
+
+			fakeClient := velerotest.NewFakeControllerRuntimeClient(t, objects...)
+			apiServer := velerotest.NewAPIServer(t)
+			discoveryHelper, err := discovery.NewHelper(apiServer.DiscoveryClient, logger)
+			require.NoError(t, err)
+
+			c := &backupReconciler{
+				logger:          logger,
+				discoveryHelper: discoveryHelper,
+				kbClient:        fakeClient,
+				clock:           &clock.RealClock{},
+				formatFlag:      formatFlag,
+			}
+
+			backup := defaultBackup().StorageLocation("loc-1").Result()
+			backup.Spec.ExcludedNamespaces = tt.specExcluded
+
+			res := c.prepareBackupRequest(t.Context(), backup, logger)
+			defer res.WorkerPool.Stop()
+
+			assert.Empty(t, res.Status.ValidationErrors)
+			assert.Equal(t, tt.expectedExcluded, res.Spec.ExcludedNamespaces)
 		})
 	}
 }

@@ -112,6 +112,7 @@ func WaitVolumeSnapshotReady(
 // GetVolumeSnapshotContentForVolumeSnapshot returns the VolumeSnapshotContent
 // object associated with the VolumeSnapshot.
 func GetVolumeSnapshotContentForVolumeSnapshot(
+	ctx context.Context,
 	volSnap *snapshotv1api.VolumeSnapshot,
 	snapshotClient snapshotter.SnapshotV1Interface,
 ) (*snapshotv1api.VolumeSnapshotContent, error) {
@@ -120,7 +121,7 @@ func GetVolumeSnapshotContentForVolumeSnapshot(
 	}
 
 	vsc, err := snapshotClient.VolumeSnapshotContents().Get(
-		context.TODO(),
+		ctx,
 		*volSnap.Status.BoundVolumeSnapshotContentName,
 		metav1.GetOptions{},
 	)
@@ -186,6 +187,12 @@ func EnsureDeleteVS(ctx context.Context, snapshotClient snapshotter.SnapshotV1In
 
 	if err != nil {
 		if errors.Is(err, context.DeadlineExceeded) {
+			// updated is only set once the VS has been retrieved successfully, so it
+			// is still nil when the deadline is exceeded before that happens, e.g.
+			// when the first Get times out. No finalizers are available to report.
+			if updated == nil {
+				return errors.Errorf("timeout to assure VolumeSnapshot %s is deleted", vsName)
+			}
 			return errors.Errorf("timeout to assure VolumeSnapshot %s is deleted, finalizers in VS %v", vsName, updated.Finalizers)
 		} else {
 			return errors.Wrapf(err, "error to assure VolumeSnapshot is deleted, %s", vsName)
@@ -245,6 +252,12 @@ func EnsureDeleteVSC(ctx context.Context, snapshotClient snapshotter.SnapshotV1I
 
 	if err != nil {
 		if errors.Is(err, context.DeadlineExceeded) {
+			// updated is only set once the VSC has been retrieved successfully, so it
+			// is still nil when the deadline is exceeded before that happens, e.g.
+			// when the first Get times out. No finalizers are available to report.
+			if updated == nil {
+				return errors.Errorf("timeout to assure VolumeSnapshotContent %s is deleted", vscName)
+			}
 			return errors.Errorf("timeout to assure VolumeSnapshotContent %s is deleted, finalizers in VSC %v", vscName, updated.Finalizers)
 		} else {
 			return errors.Wrapf(err, "error to assure VolumeSnapshotContent is deleted, %s", vscName)
@@ -309,14 +322,16 @@ func patchVSC(
 }
 
 func GetVolumeSnapshotClass(
+	ctx context.Context,
 	provisioner string,
 	backup *velerov1api.Backup,
 	pvc *corev1api.PersistentVolumeClaim,
 	log logrus.FieldLogger,
 	crClient crclient.Client,
+	policySnapshotClass string,
 ) (*snapshotv1api.VolumeSnapshotClass, error) {
 	snapshotClasses := new(snapshotv1api.VolumeSnapshotClassList)
-	err := crClient.List(context.TODO(), snapshotClasses)
+	err := crClient.List(ctx, snapshotClasses)
 	if err != nil {
 		return nil, errors.Wrap(err, "error listing VolumeSnapshotClass")
 	}
@@ -326,6 +341,16 @@ func GetVolumeSnapshotClass(
 	)
 	if err != nil {
 		log.Debugf("Didn't find VolumeSnapshotClass from PVC annotations: %v", err)
+	}
+	if snapshotClass != nil {
+		return snapshotClass, nil
+	}
+
+	// If a snapshot class is specified by volume policy, use that
+	snapshotClass, err = GetVolumeSnapshotClassFromVolumePolicy(
+		policySnapshotClass, provisioner, snapshotClasses)
+	if err != nil {
+		log.Debugf("Didn't find VolumeSnapshotClass from volume policy: %v", err)
 	}
 	if snapshotClass != nil {
 		return snapshotClass, nil
@@ -412,6 +437,34 @@ func GetVolumeSnapshotClassFromBackupAnnotationsForDriver(
 	)
 }
 
+// GetVolumeSnapshotClassFromVolumePolicy returns a VolumeSnapshotClass
+// specified by a volume policy's snapshotClass parameter. If
+// policySnapshotClass is empty, it returns nil (no match).
+func GetVolumeSnapshotClassFromVolumePolicy(
+	policySnapshotClass string,
+	provisioner string,
+	snapshotClasses *snapshotv1api.VolumeSnapshotClassList,
+) (*snapshotv1api.VolumeSnapshotClass, error) {
+	if policySnapshotClass == "" {
+		return nil, nil
+	}
+	for _, sc := range snapshotClasses.Items {
+		if strings.EqualFold(policySnapshotClass, sc.ObjectMeta.Name) {
+			if !strings.EqualFold(sc.Driver, provisioner) {
+				return nil, errors.Errorf(
+					"VolumeSnapshotClass %s specified by volume policy is not for driver %s",
+					sc.ObjectMeta.Name, provisioner,
+				)
+			}
+			return &sc, nil
+		}
+	}
+	return nil, errors.Errorf(
+		"No CSI VolumeSnapshotClass found with name %s specified by volume policy for driver %s",
+		policySnapshotClass, provisioner,
+	)
+}
+
 // GetVolumeSnapshotClassForStorageClass returns a VolumeSnapshotClass
 // for the supplied volume provisioner/ driver name.
 func GetVolumeSnapshotClassForStorageClass(
@@ -478,13 +531,14 @@ func IsVolumeSnapshotContentHasDeleteSecret(vsc *snapshotv1api.VolumeSnapshotCon
 
 // IsVolumeSnapshotExists returns whether a specific volumesnapshot object exists.
 func IsVolumeSnapshotExists(
+	ctx context.Context,
 	ns,
 	name string,
 	crClient crclient.Client,
 ) bool {
 	vs := new(snapshotv1api.VolumeSnapshot)
 	err := crClient.Get(
-		context.TODO(),
+		ctx,
 		crclient.ObjectKey{Namespace: ns, Name: name},
 		vs,
 	)
@@ -493,24 +547,26 @@ func IsVolumeSnapshotExists(
 }
 
 func SetVolumeSnapshotContentDeletionPolicy(
+	ctx context.Context,
 	vscName string,
 	crClient crclient.Client,
 	policy snapshotv1api.DeletionPolicy,
 ) (*snapshotv1api.VolumeSnapshotContent, error) {
 	vsc := new(snapshotv1api.VolumeSnapshotContent)
-	if err := crClient.Get(context.TODO(), crclient.ObjectKey{Name: vscName}, vsc); err != nil {
+	if err := crClient.Get(ctx, crclient.ObjectKey{Name: vscName}, vsc); err != nil {
 		return nil, err
 	}
 
 	originVSC := vsc.DeepCopy()
 	vsc.Spec.DeletionPolicy = policy
 
-	return vsc, crClient.Patch(context.TODO(), vsc, crclient.MergeFrom(originVSC))
+	return vsc, crClient.Patch(ctx, vsc, crclient.MergeFrom(originVSC))
 }
 
 // CleanupVolumeSnapshot deletes the VolumeSnapshot and the associated VolumeSnapshotContent.  It will make sure the
 // physical snapshot is also deleted.
 func CleanupVolumeSnapshot(
+	ctx context.Context,
 	volSnap *snapshotv1api.VolumeSnapshot,
 	crClient crclient.Client,
 	log logrus.FieldLogger,
@@ -518,7 +574,7 @@ func CleanupVolumeSnapshot(
 	log.Infof("Deleting Volumesnapshot %s/%s", volSnap.Namespace, volSnap.Name)
 	vs := new(snapshotv1api.VolumeSnapshot)
 	err := crClient.Get(
-		context.TODO(),
+		ctx,
 		crclient.ObjectKey{Name: volSnap.Name, Namespace: volSnap.Namespace},
 		vs,
 	)
@@ -531,6 +587,7 @@ func CleanupVolumeSnapshot(
 		// we patch the DeletionPolicy of the VolumeSnapshotContent to set it to Delete.
 		// This ensures that the volume snapshot in the storage provider is also deleted.
 		_, err := SetVolumeSnapshotContentDeletionPolicy(
+			ctx,
 			*vs.Status.BoundVolumeSnapshotContentName,
 			crClient,
 			snapshotv1api.VolumeSnapshotContentDelete,
@@ -540,7 +597,7 @@ func CleanupVolumeSnapshot(
 				vs.Namespace, vs.Name)
 		}
 	}
-	err = crClient.Delete(context.TODO(), vs)
+	err = crClient.Delete(ctx, vs)
 	if err != nil {
 		log.Debugf("Failed to delete volumesnapshot %s/%s: %v", vs.Namespace, vs.Name, err)
 	} else {
@@ -550,6 +607,7 @@ func CleanupVolumeSnapshot(
 }
 
 func DeleteReadyVolumeSnapshot(
+	ctx context.Context,
 	vs snapshotv1api.VolumeSnapshot,
 	client crclient.Client,
 	logger logrus.FieldLogger,
@@ -571,6 +629,7 @@ func DeleteReadyVolumeSnapshot(
 		// Patch the DeletionPolicy of the VolumeSnapshotContent to set it to Retain.
 		// This ensures that the volume snapshot in the storage provider is kept.
 		if vsc, err = SetVolumeSnapshotContentDeletionPolicy(
+			ctx,
 			*vs.Status.BoundVolumeSnapshotContentName,
 			client,
 			snapshotv1api.VolumeSnapshotContentRetain,
@@ -580,11 +639,11 @@ func DeleteReadyVolumeSnapshot(
 			return
 		}
 
-		if err := client.Delete(context.TODO(), vsc); err != nil {
+		if err := client.Delete(ctx, vsc); err != nil {
 			logger.WithError(err).Warnf("Failed to delete the VolumeSnapshotContent %s", vsc.Name)
 		}
 	}
-	if err := client.Delete(context.TODO(), &vs); err != nil {
+	if err := client.Delete(ctx, &vs); err != nil {
 		logger.WithError(err).Warnf("Failed to delete VolumeSnapshot %s", vs.Namespace+"/"+vs.Name)
 	} else {
 		logger.Infof("Deleted VolumeSnapshot %s and VolumeSnapshotContent %s",
@@ -654,7 +713,7 @@ func WaitUntilVSCHandleIsReady(
 			if vsc.Status != nil &&
 				vsc.Status.Error != nil {
 				log.Warnf("VolumeSnapshotContent %s has error: %v",
-					vsc.Name, *vsc.Status.Error.Message)
+					vsc.Name, stringptr.GetString(vsc.Status.Error.Message))
 			}
 			return false, nil
 		}
@@ -705,10 +764,10 @@ func WaitUntilVSCHandleIsReady(
 				vsc.Status.Error != nil {
 				log.Errorf(
 					"Timed out awaiting reconciliation of VolumeSnapshot, VolumeSnapshotContent %s has error: %v",
-					vsc.Name, *vsc.Status.Error.Message)
+					vsc.Name, stringptr.GetString(vsc.Status.Error.Message))
 				return nil,
 					errors.Errorf("CSI got timed out with error: %v",
-						*vsc.Status.Error.Message)
+						stringptr.GetString(vsc.Status.Error.Message))
 			} else {
 				log.Errorf(
 					"Timed out awaiting reconciliation of volumesnapshot %s/%s",

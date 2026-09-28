@@ -102,7 +102,7 @@ func TestOnDataDownloadCompleted(t *testing.T) {
 		{
 			name:        "marshal fail",
 			marshalErr:  errors.New("fake-marshal-error"),
-			expectedErr: "Failed to marshal restore result {{ } 0}: fake-marshal-error",
+			expectedErr: "Failed to marshal restore result {{ } 0 0 false}: fake-marshal-error",
 		},
 		{
 			name:                "succeed",
@@ -291,7 +291,7 @@ func TestRunCancelableRestore(t *testing.T) {
 			kubeClientObj:    []runtime.Object{ddInProgress},
 			dataPathStarted:  true,
 			expectedEventMsg: fmt.Sprintf("Data path for %s stopped", dataDownloadName),
-			expectedErr:      "timed out waiting for fs restore to complete",
+			expectedErr:      "timed out waiting for restore to complete",
 		},
 		{
 			name:            "data path returns error",
@@ -355,12 +355,12 @@ func TestRunCancelableRestore(t *testing.T) {
 
 				if test.startErr != nil {
 					fsBR.On("Init", mock.Anything, mock.Anything).Return(nil)
-					fsBR.On("StartRestore", mock.Anything, mock.Anything, mock.Anything).Return(test.startErr)
+					fsBR.On("StartRestore", mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return(test.startErr)
 				}
 
 				if test.dataPathStarted {
 					fsBR.On("Init", mock.Anything, mock.Anything).Return(nil)
-					fsBR.On("StartRestore", mock.Anything, mock.Anything, mock.Anything).Return(nil)
+					fsBR.On("StartRestore", mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return(nil)
 				}
 
 				return fsBR

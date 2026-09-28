@@ -392,7 +392,7 @@ var _ = Describe(
 	APIGroupVersionsTest,
 )
 var _ = Describe(
-	"CRD of apiextentions v1beta1 should be B/R successfully from cluster(k8s version < 1.22) to cluster(k8s version >= 1.22)",
+	"CRD of apiextensions v1beta1 should be B/R successfully from cluster(k8s version < 1.22) to cluster(k8s version >= 1.22)",
 	Label("APIGroup", "APIExtensions", "SKIP_KIND"),
 	APIExtensionsVersionsTest,
 )
@@ -522,6 +522,11 @@ var _ = Describe(
 	"Velero test on skip backup of volume by resource policies",
 	Label("ResourceFiltering", "ResourcePolicies", "FSBackup"),
 	ResourcePoliciesTest,
+)
+var _ = Describe(
+	"Velero test on namespace selection by label via resource policies",
+	Label("ResourceFiltering", "ResourcePolicies"),
+	NamespaceLabelSelectorTest,
 )
 
 // backup VolumeInfo test

@@ -549,6 +549,195 @@ func TestValidate(t *testing.T) {
 			},
 			wantErr: false,
 		},
+		{
+			name: "snapshot action with valid dataMover velero-fs",
+			res: &ResourcePolicies{
+				Version: "v1",
+				VolumePolicies: []VolumePolicy{
+					{
+						Action: Action{
+							Type:       Snapshot,
+							Parameters: map[string]any{"dataMover": "velero-fs"},
+						},
+						Conditions: map[string]any{"storageClass": []string{"gp2"}},
+					},
+				},
+			},
+			wantErr: false,
+		},
+		{
+			name: "snapshot action with valid dataMover velero-block",
+			res: &ResourcePolicies{
+				Version: "v1",
+				VolumePolicies: []VolumePolicy{
+					{
+						Action: Action{
+							Type:       Snapshot,
+							Parameters: map[string]any{"dataMover": "velero-block"},
+						},
+						Conditions: map[string]any{"storageClass": []string{"gp2"}},
+					},
+				},
+			},
+			wantErr: false,
+		},
+		{
+			name: "snapshot action with valid dataMover velero",
+			res: &ResourcePolicies{
+				Version: "v1",
+				VolumePolicies: []VolumePolicy{
+					{
+						Action: Action{
+							Type:       Snapshot,
+							Parameters: map[string]any{"dataMover": "velero"},
+						},
+						Conditions: map[string]any{"storageClass": []string{"gp2"}},
+					},
+				},
+			},
+			wantErr: false,
+		},
+		{
+			name: "snapshot action with invalid dataMover value",
+			res: &ResourcePolicies{
+				Version: "v1",
+				VolumePolicies: []VolumePolicy{
+					{
+						Action: Action{
+							Type:       Snapshot,
+							Parameters: map[string]any{"dataMover": "unknown-mover"},
+						},
+						Conditions: map[string]any{"storageClass": []string{"gp2"}},
+					},
+				},
+			},
+			wantErr: true,
+		},
+		{
+			name: "snapshot action with non-string dataMover value",
+			res: &ResourcePolicies{
+				Version: "v1",
+				VolumePolicies: []VolumePolicy{
+					{
+						Action: Action{
+							Type:       Snapshot,
+							Parameters: map[string]any{"dataMover": 123},
+						},
+						Conditions: map[string]any{"storageClass": []string{"gp2"}},
+					},
+				},
+			},
+			wantErr: true,
+		},
+		{
+			name: "dataMover parameter on non-snapshot action is rejected",
+			res: &ResourcePolicies{
+				Version: "v1",
+				VolumePolicies: []VolumePolicy{
+					{
+						Action: Action{
+							Type:       FSBackup,
+							Parameters: map[string]any{"dataMover": "velero-fs"},
+						},
+						Conditions: map[string]any{"storageClass": []string{"gp2"}},
+					},
+				},
+			},
+			wantErr: true,
+		},
+		{
+			name: "snapshot action without parameters still valid",
+			res: &ResourcePolicies{
+				Version: "v1",
+				VolumePolicies: []VolumePolicy{
+					{
+						Action:     Action{Type: Snapshot},
+						Conditions: map[string]any{"storageClass": []string{"gp2"}},
+					},
+				},
+			},
+			wantErr: false,
+		},
+		{
+			name: "snapshot action with valid snapshotClass",
+			res: &ResourcePolicies{
+				Version: "v1",
+				VolumePolicies: []VolumePolicy{
+					{
+						Action: Action{
+							Type:       Snapshot,
+							Parameters: map[string]any{"snapshotClass": "my-vsc"},
+						},
+						Conditions: map[string]any{"storageClass": []string{"gp2"}},
+					},
+				},
+			},
+			wantErr: false,
+		},
+		{
+			name: "snapshot action with both snapshotClass and dataMover",
+			res: &ResourcePolicies{
+				Version: "v1",
+				VolumePolicies: []VolumePolicy{
+					{
+						Action: Action{
+							Type:       Snapshot,
+							Parameters: map[string]any{"snapshotClass": "my-vsc", "dataMover": "velero-fs"},
+						},
+						Conditions: map[string]any{"storageClass": []string{"gp2"}},
+					},
+				},
+			},
+			wantErr: false,
+		},
+		{
+			name: "snapshotClass parameter on non-snapshot action is rejected",
+			res: &ResourcePolicies{
+				Version: "v1",
+				VolumePolicies: []VolumePolicy{
+					{
+						Action: Action{
+							Type:       FSBackup,
+							Parameters: map[string]any{"snapshotClass": "my-vsc"},
+						},
+						Conditions: map[string]any{"storageClass": []string{"gp2"}},
+					},
+				},
+			},
+			wantErr: true,
+		},
+		{
+			name: "snapshot action with non-string snapshotClass is rejected",
+			res: &ResourcePolicies{
+				Version: "v1",
+				VolumePolicies: []VolumePolicy{
+					{
+						Action: Action{
+							Type:       Snapshot,
+							Parameters: map[string]any{"snapshotClass": 123},
+						},
+						Conditions: map[string]any{"storageClass": []string{"gp2"}},
+					},
+				},
+			},
+			wantErr: true,
+		},
+		{
+			name: "snapshot action with empty snapshotClass is rejected",
+			res: &ResourcePolicies{
+				Version: "v1",
+				VolumePolicies: []VolumePolicy{
+					{
+						Action: Action{
+							Type:       Snapshot,
+							Parameters: map[string]any{"snapshotClass": ""},
+						},
+						Conditions: map[string]any{"storageClass": []string{"gp2"}},
+					},
+				},
+			},
+			wantErr: true,
+		},
 	}
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {

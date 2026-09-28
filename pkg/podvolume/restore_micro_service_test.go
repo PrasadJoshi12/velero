@@ -165,7 +165,7 @@ func TestOnPvrCompleted(t *testing.T) {
 		{
 			name:        "marshal fail",
 			marshalErr:  errors.New("fake-marshal-error"),
-			expectedErr: "error marshaling restore result {{ } 0}: fake-marshal-error",
+			expectedErr: "error marshaling restore result {{ } 0 0 false}: fake-marshal-error",
 		},
 		{
 			name:                "succeed",
@@ -436,12 +436,12 @@ func TestRunCancelableDataPathRestore(t *testing.T) {
 
 				if test.startErr != nil {
 					fsBR.On("Init", mock.Anything, mock.Anything).Return(nil)
-					fsBR.On("StartRestore", mock.Anything, mock.Anything, mock.Anything).Return(test.startErr)
+					fsBR.On("StartRestore", mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return(test.startErr)
 				}
 
 				if test.dataPathStarted {
 					fsBR.On("Init", mock.Anything, mock.Anything).Return(nil)
-					fsBR.On("StartRestore", mock.Anything, mock.Anything, mock.Anything).Return(nil)
+					fsBR.On("StartRestore", mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return(nil)
 				}
 
 				return fsBR
