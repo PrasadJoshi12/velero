@@ -149,6 +149,7 @@ func TestVSExecute(t *testing.T) {
 			name: "Normal case, VSC should be created",
 			vs: builder.ForVolumeSnapshot("ns", "vsName").
 				ObjectMeta(
+					builder.WithFinalizers("snapshot.storage.kubernetes.io/volumesnapshot-in-group-protection"),
 					builder.WithAnnotationsMap(
 						map[string]string{
 							velerov1api.VolumeSnapshotHandleAnnotation: "vsc",
@@ -216,6 +217,7 @@ func TestVSExecute(t *testing.T) {
 				require.NoError(t, runtime.DefaultUnstructuredConverter.FromUnstructured(
 					result.UpdatedItem.UnstructuredContent(), &vs))
 				require.Equal(t, test.expectedVS.Spec, vs.Spec)
+				require.NotContains(t, vs.Finalizers, "snapshot.storage.kubernetes.io/volumesnapshot-in-group-protection")
 				require.Equal(t, "true", vs.GetAnnotations()[velerov1api.MustIncludeAdditionalItemRestoreAnnotation])
 				require.Len(t, result.AdditionalItems, 1)
 				require.Equal(t, "volumesnapshotcontents.snapshot.storage.k8s.io", result.AdditionalItems[0].GroupResource.String())

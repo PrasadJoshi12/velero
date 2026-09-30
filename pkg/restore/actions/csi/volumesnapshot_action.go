@@ -31,6 +31,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/util/retry"
 	crclient "sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 
 	velerov1api "github.com/vmware-tanzu/velero/pkg/apis/velero/v1"
 	"github.com/vmware-tanzu/velero/pkg/client"
@@ -48,6 +49,8 @@ type volumeSnapshotRestoreItemAction struct {
 	log      logrus.FieldLogger
 	crClient crclient.Client
 }
+
+const volumeSnapshotInGroupFinalizer = "snapshot.storage.kubernetes.io/volumesnapshot-in-group-protection"
 
 // AppliesTo returns information indicating that
 // VolumeSnapshotRestoreItemAction should be invoked while
@@ -264,6 +267,9 @@ func (p *volumeSnapshotRestoreItemAction) Execute(
 		return &velero.RestoreItemActionExecuteOutput{},
 			errors.Wrapf(err, "failed to convert input.Item from unstructured")
 	}
+	// Restored group members are restored as independent VolumeSnapshots. The
+	// source VGS is not restored and cannot release this source-cluster finalizer.
+	controllerutil.RemoveFinalizer(&vs, volumeSnapshotInGroupFinalizer)
 
 	var vsFromBackup snapshotv1api.VolumeSnapshot
 	if err := runtime.DefaultUnstructuredConverter.FromUnstructured(
