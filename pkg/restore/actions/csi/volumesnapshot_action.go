@@ -50,8 +50,6 @@ type volumeSnapshotRestoreItemAction struct {
 	crClient crclient.Client
 }
 
-const volumeSnapshotInGroupFinalizer = "snapshot.storage.kubernetes.io/volumesnapshot-in-group-protection"
-
 // AppliesTo returns information indicating that
 // VolumeSnapshotRestoreItemAction should be invoked while
 // restoring volumesnapshots.snapshot.storage.k8s.io resources.
@@ -269,7 +267,7 @@ func (p *volumeSnapshotRestoreItemAction) Execute(
 	}
 	// Restored group members are restored as independent VolumeSnapshots. The
 	// source VGS is not restored and cannot release this source-cluster finalizer.
-	controllerutil.RemoveFinalizer(&vs, volumeSnapshotInGroupFinalizer)
+	controllerutil.RemoveFinalizer(&vs, csiutil.VolumeSnapshotInGroupFinalizer)
 
 	var vsFromBackup snapshotv1api.VolumeSnapshot
 	if err := runtime.DefaultUnstructuredConverter.FromUnstructured(

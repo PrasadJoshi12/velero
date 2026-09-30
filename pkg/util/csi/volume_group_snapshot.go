@@ -23,6 +23,7 @@ import (
 	snapshotv1 "github.com/kubernetes-csi/external-snapshotter/client/v8/apis/volumesnapshot/v1"
 	"github.com/sirupsen/logrus"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	kubeerrs "k8s.io/apimachinery/pkg/util/errors"
 	"k8s.io/client-go/util/retry"
 	crclient "sigs.k8s.io/controller-runtime/pkg/client"
 
@@ -39,71 +40,116 @@ func CleanupBackupVolumeGroupSnapshots(ctx context.Context, backup *velerov1.Bac
 		return nil
 	}
 
+	var cleanupErrs []error
 	groups, err := ListVGS(ctx, client, "", map[string]string{velerov1.BackupUIDLabel: string(backup.UID)})
 	if err != nil {
 		if errors.Is(err, ErrVGSAPINotAvailable) {
 			return nil
 		}
-		return errors.Wrap(err, "listing backup VolumeGroupSnapshots")
+		cleanupErrs = append(cleanupErrs, errors.Wrap(err, "listing backup VolumeGroupSnapshots"))
 	}
 	contents, err := ListVGSC(ctx, client, map[string]string{velerov1.BackupUIDLabel: string(backup.UID)})
 	if err != nil && !errors.Is(err, ErrVGSAPINotAvailable) {
-		return errors.Wrap(err, "listing backup VolumeGroupSnapshotContents")
+		cleanupErrs = append(cleanupErrs, errors.Wrap(err, "listing backup VolumeGroupSnapshotContents"))
 	}
 	processedContents := map[string]struct{}{}
 	if err == nil {
 		for i := range contents.Items {
 			content := &contents.Items[i]
-			processedContents[content.Name] = struct{}{}
-			content.Spec.DeletionPolicy = snapshotv1.VolumeSnapshotContentRetain
-			if _, err := UpdateVGSC(ctx, client, content); err != nil {
-				return errors.Wrapf(err, "retaining VolumeGroupSnapshotContent %s", content.Name)
-			}
-			if err := DeleteVGSC(ctx, client, content.Name); err != nil && !apierrors.IsNotFound(err) {
-				return errors.Wrapf(err, "deleting VolumeGroupSnapshotContent %s", content.Name)
+			if err := retainAndDeleteVGSC(ctx, client, content.Name, nil, false); err != nil {
+				cleanupErrs = append(cleanupErrs, err)
+			} else {
+				processedContents[content.Name] = struct{}{}
 			}
 		}
 	}
 
-	for i := range groups.Items {
-		group := &groups.Items[i]
-		if group.Status != nil && group.Status.BoundVolumeGroupSnapshotContentName != nil {
-			contentName := *group.Status.BoundVolumeGroupSnapshotContentName
-			_, processed := processedContents[contentName]
-			err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
-				if processed {
-					return nil
-				}
-				content, err := GetVGSC(ctx, client, contentName)
-				if err != nil {
-					if apierrors.IsNotFound(err) {
-						return nil
+	memberContents := &snapshotv1.VolumeSnapshotContentList{}
+	if err := client.List(ctx, memberContents, crclient.MatchingLabels(map[string]string{velerov1.BackupUIDLabel: string(backup.UID)})); err != nil {
+		cleanupErrs = append(cleanupErrs, errors.Wrap(err, "listing backup VolumeSnapshotContents"))
+	}
+	// VGS members skip individual finalization while the parent exists. Retain
+	// their backend snapshots before VGS deletion even if a driver omitted the
+	// member VolumeGroupSnapshotHandle status field.
+	memberRetentionFailed := false
+	for i := range memberContents.Items {
+		content := &memberContents.Items[i]
+		if content.Spec.DeletionPolicy == snapshotv1.VolumeSnapshotContentRetain {
+			continue
+		}
+		if err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+			current := &snapshotv1.VolumeSnapshotContent{}
+			if err := client.Get(ctx, crclient.ObjectKeyFromObject(content), current); err != nil {
+				return err
+			}
+			current.Spec.DeletionPolicy = snapshotv1.VolumeSnapshotContentRetain
+			return client.Update(ctx, current)
+		}); err != nil {
+			cleanupErrs = append(cleanupErrs, errors.Wrapf(err, "retaining VolumeSnapshotContent %s", content.Name))
+			memberRetentionFailed = true
+		}
+	}
+
+	if groups != nil {
+		for i := range groups.Items {
+			group := &groups.Items[i]
+			if group.Status != nil && group.Status.BoundVolumeGroupSnapshotContentName != nil {
+				contentName := *group.Status.BoundVolumeGroupSnapshotContentName
+				_, processed := processedContents[contentName]
+				// The label pass handles the normal path. This status-based fallback
+				// recovers content when backup processing failed before labels were set.
+				if !processed {
+					content, err := GetVGSC(ctx, client, contentName)
+					if err != nil && !apierrors.IsNotFound(err) {
+						cleanupErrs = append(cleanupErrs, errors.Wrapf(err, "getting content of VolumeGroupSnapshot %s/%s", group.Namespace, group.Name))
+						continue
 					}
-					return err
+					if err == nil {
+						ref := content.Spec.VolumeGroupSnapshotRef
+						if ref.UID != group.UID || ref.Name != group.Name || ref.Namespace != group.Namespace {
+							cleanupErrs = append(cleanupErrs, errors.Errorf("VolumeGroupSnapshotContent %s is not bound to %s/%s", content.Name, group.Namespace, group.Name))
+						} else if err := retainAndDeleteVGSC(ctx, client, contentName, backup, true); err != nil {
+							cleanupErrs = append(cleanupErrs, err)
+							continue
+						}
+					}
 				}
-				ref := content.Spec.VolumeGroupSnapshotRef
-				if ref.UID != group.UID || ref.Name != group.Name || ref.Namespace != group.Namespace {
-					return errors.Errorf("VolumeGroupSnapshotContent %s is not bound to %s/%s", content.Name, group.Namespace, group.Name)
-				}
-				kubeutil.AddLabels(&content.ObjectMeta, map[string]string{
-					velerov1.BackupNameLabel: label.GetValidName(backup.Name),
-					velerov1.BackupUIDLabel:  string(backup.UID),
-				})
-				content.Spec.DeletionPolicy = snapshotv1.VolumeSnapshotContentRetain
-				if _, err := UpdateVGSC(ctx, client, content); err != nil {
-					return err
-				}
-				return DeleteVGSC(ctx, client, content.Name)
-			})
-			if err != nil {
-				return errors.Wrapf(err, "cleaning up content of VolumeGroupSnapshot %s/%s", group.Namespace, group.Name)
+			}
+
+			if memberRetentionFailed {
+				continue
+			}
+			log.Infof("Cleaning up VolumeGroupSnapshot %s/%s after backup finalization", group.Namespace, group.Name)
+			if err := DeleteVGS(ctx, client, group.Namespace, group.Name); err != nil && !apierrors.IsNotFound(err) {
+				cleanupErrs = append(cleanupErrs, errors.Wrapf(err, "deleting VolumeGroupSnapshot %s/%s", group.Namespace, group.Name))
 			}
 		}
-
-		log.Infof("Cleaning up VolumeGroupSnapshot %s/%s after backup finalization", group.Namespace, group.Name)
-		if err := DeleteVGS(ctx, client, group.Namespace, group.Name); err != nil && !apierrors.IsNotFound(err) {
-			return errors.Wrapf(err, "deleting VolumeGroupSnapshot %s/%s", group.Namespace, group.Name)
-		}
 	}
-	return nil
+	return kubeerrs.NewAggregate(cleanupErrs)
+}
+
+func retainAndDeleteVGSC(ctx context.Context, client crclient.Client, contentName string, backup *velerov1.Backup, labelContent bool) error {
+	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		content, err := GetVGSC(ctx, client, contentName)
+		if err != nil {
+			if apierrors.IsNotFound(err) {
+				return nil
+			}
+			return err
+		}
+		if labelContent {
+			kubeutil.AddLabels(&content.ObjectMeta, map[string]string{
+				velerov1.BackupNameLabel: label.GetValidName(backup.Name),
+				velerov1.BackupUIDLabel:  string(backup.UID),
+			})
+		}
+		content.Spec.DeletionPolicy = snapshotv1.VolumeSnapshotContentRetain
+		if _, err := UpdateVGSC(ctx, client, content); err != nil {
+			return errors.Wrapf(err, "retaining VolumeGroupSnapshotContent %s", content.Name)
+		}
+		if err := DeleteVGSC(ctx, client, content.Name); err != nil && !apierrors.IsNotFound(err) {
+			return errors.Wrapf(err, "deleting VolumeGroupSnapshotContent %s", content.Name)
+		}
+		return nil
+	})
 }

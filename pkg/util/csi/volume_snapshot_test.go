@@ -349,7 +349,7 @@ func TestEnsureDeleteVS(t *testing.T) {
 					},
 				},
 			},
-			err: "error to assure VolumeSnapshot is deleted, fake-vs: error to get VolumeSnapshot fake-vs: fake-get-error",
+			err: "checking VGS membership before deleting VolumeSnapshot: fake-get-error",
 		},
 		{
 			name:      "wait timeout",
@@ -404,7 +404,7 @@ func TestEnsureDeleteVS(t *testing.T) {
 					},
 				},
 			},
-			err: "timeout to assure VolumeSnapshot fake-vs is deleted",
+			err: "checking VGS membership before deleting VolumeSnapshot: context deadline exceeded",
 		},
 		{
 			name:      "success",
@@ -495,7 +495,7 @@ func TestEnsureDeleteVSC(t *testing.T) {
 					},
 				},
 			},
-			err: "error to assure VolumeSnapshotContent is deleted, fake-vsc: error to get VolumeSnapshotContent fake-vsc: fake-get-error",
+			err: "checking VGS membership before deleting VolumeSnapshotContent: fake-get-error",
 		},
 		{
 			name:      "wait timeout",
@@ -547,7 +547,7 @@ func TestEnsureDeleteVSC(t *testing.T) {
 					},
 				},
 			},
-			err: "timeout to assure VolumeSnapshotContent fake-vsc is deleted",
+			err: "checking VGS membership before deleting VolumeSnapshotContent: context deadline exceeded",
 		},
 		{
 			name:      "success",
@@ -657,6 +657,23 @@ func TestDeleteVolumeSnapshotIfAny(t *testing.T) {
 			vsNamespace: "fake-ns",
 			logMessage:  "Abort deleting volume snapshot, it doesn't exist fake-ns/fake-vs",
 			logLevel:    "level=debug",
+		},
+		{
+			name:        "membership lookup fails",
+			vsName:      "fake-vs",
+			vsNamespace: "fake-ns",
+			reactors: []reactor{
+				{
+					verb:     "get",
+					resource: "volumesnapshots",
+					reactorFunc: func(action clientTesting.Action) (handled bool, ret runtime.Object, err error) {
+						return true, nil, errors.New("fake-get-error")
+					},
+				},
+			},
+			logMessage: "Unable to check VGS membership for VolumeSnapshot fake-ns/fake-vs",
+			logLevel:   "level=warning",
+			logError:   "error=fake-get-error",
 		},
 		{
 			name:        "delete fail",

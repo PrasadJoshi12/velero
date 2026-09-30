@@ -75,6 +75,7 @@ func TestVSExecute(t *testing.T) {
 		{
 			name: "Normal case",
 			backup: builder.ForBackup("velero", "backup").
+				ObjectMeta(builder.WithUID("backup-uid")).
 				Phase(velerov1api.BackupPhaseInProgress).Result(),
 			vs: builder.ForVolumeSnapshot("velero", "vs").
 				ObjectMeta(builder.WithLabels(
@@ -173,7 +174,7 @@ func TestVSExecute(t *testing.T) {
 	}
 
 	for _, tc := range tests {
-		t.Run(tc.name, func(*testing.T) {
+		t.Run(tc.name, func(t *testing.T) {
 			vsBIA := volumeSnapshotBackupItemAction{
 				log:      logrus.New(),
 				crClient: velerotest.NewFakeControllerRuntimeClient(t, tc.vs),
@@ -195,6 +196,11 @@ func TestVSExecute(t *testing.T) {
 
 			require.ElementsMatch(t, tc.expectedAdditionalItems, additionalItems)
 			require.ElementsMatch(t, tc.expectedItemToUpdate, itemToUpdate)
+			if tc.name == "Normal case" {
+				updatedVSC := &snapshotv1api.VolumeSnapshotContent{}
+				require.NoError(t, vsBIA.crClient.Get(t.Context(), crclient.ObjectKey{Name: "vsc"}, updatedVSC))
+				require.Equal(t, "backup-uid", updatedVSC.Labels[velerov1api.BackupUIDLabel])
+			}
 		})
 	}
 }

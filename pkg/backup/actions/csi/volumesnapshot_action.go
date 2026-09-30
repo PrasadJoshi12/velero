@@ -190,6 +190,7 @@ func (p *volumeSnapshotBackupItemAction) Execute(
 			&vsc.ObjectMeta,
 			map[string]string{
 				velerov1api.BackupNameLabel: label.GetValidName(backup.Name),
+				velerov1api.BackupUIDLabel:  string(backup.UID),
 			},
 		)
 
