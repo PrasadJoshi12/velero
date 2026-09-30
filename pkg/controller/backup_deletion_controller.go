@@ -36,6 +36,7 @@ import (
 	"k8s.io/utils/clock"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 
 	"github.com/vmware-tanzu/velero/internal/credentials"
 	"github.com/vmware-tanzu/velero/internal/delete"
@@ -182,6 +183,10 @@ func (r *backupDeletionReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 		return ctrl.Result{}, err
 	} else if err != nil {
 		return ctrl.Result{}, errors.Wrap(err, "error getting backup")
+	}
+	if controllerutil.ContainsFinalizer(backup, csi.VGSBackupFinalizer) {
+		err := r.patchDeleteBackupRequestWithError(ctx, dbr, errors.Errorf("backup is waiting for VolumeGroupSnapshot cleanup"))
+		return ctrl.Result{}, err
 	}
 
 	// Don't allow deleting backups in read-only storage locations

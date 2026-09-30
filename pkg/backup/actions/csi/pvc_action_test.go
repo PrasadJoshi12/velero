@@ -34,7 +34,6 @@ import (
 	appsv1api "k8s.io/api/apps/v1"
 	corev1api "k8s.io/api/core/v1"
 	storagev1api "k8s.io/api/storage/v1"
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -1492,8 +1491,9 @@ func TestCreateVolumeGroupSnapshot(t *testing.T) {
 	testVGSClass := "test-class"
 	testBackup := &velerov1api.Backup{
 		ObjectMeta: metav1.ObjectMeta{
-			Name: "test-backup",
-			UID:  "test-uid",
+			Name:            "test-backup",
+			UID:             "test-uid",
+			ResourceVersion: "1",
 		},
 	}
 	testPVC := corev1api.PersistentVolumeClaim{
@@ -1507,7 +1507,7 @@ func TestCreateVolumeGroupSnapshot(t *testing.T) {
 	}
 
 	log := logrus.New()
-	crClient := velerotest.NewFakeControllerRuntimeClientWithVGS(t)
+	crClient := velerotest.NewFakeControllerRuntimeClientWithVGS(t, testBackup)
 	action := &pvcBackupItemAction{
 		log:      log,
 		crClient: crClient,
@@ -1516,6 +1516,9 @@ func TestCreateVolumeGroupSnapshot(t *testing.T) {
 	vgs, err := action.createVolumeGroupSnapshot(t.Context(), testBackup, testPVC, testLabelKey, testLabelValue, testVGSClass)
 	require.NoError(t, err)
 	require.NotNil(t, vgs)
+	updatedBackup := &velerov1api.Backup{}
+	require.NoError(t, crClient.Get(t.Context(), crclient.ObjectKeyFromObject(testBackup), updatedBackup))
+	assert.Contains(t, updatedBackup.Finalizers, csi.VGSBackupFinalizer)
 
 	// Verify VGS fields
 	assert.Equal(t, testNamespace, vgs.Namespace)
@@ -1861,87 +1864,6 @@ func TestPatchVGSCDeletionPolicy(t *testing.T) {
 			updated, err := csi.GetVGSC(t.Context(), crClient, "test-vgsc")
 			require.NoError(t, err)
 			require.Equal(t, tt.expectedPolicy, updated.Spec.DeletionPolicy)
-		})
-	}
-}
-
-func TestDeleteVGSAndVGSC(t *testing.T) {
-	makeVGS := func(name, namespace string, boundVGSCName *string) *volumegroupsnapshotv1.VolumeGroupSnapshot {
-		return &volumegroupsnapshotv1.VolumeGroupSnapshot{
-			ObjectMeta: metav1.ObjectMeta{
-				Name:      name,
-				Namespace: namespace,
-			},
-			Status: &volumegroupsnapshotv1.VolumeGroupSnapshotStatus{
-				BoundVolumeGroupSnapshotContentName: boundVGSCName,
-			},
-		}
-	}
-
-	makeVGSC := func(name string) *volumegroupsnapshotv1.VolumeGroupSnapshotContent {
-		return &volumegroupsnapshotv1.VolumeGroupSnapshotContent{
-			ObjectMeta: metav1.ObjectMeta{
-				Name: name,
-			},
-		}
-	}
-
-	tests := []struct {
-		name             string
-		vgs              *volumegroupsnapshotv1.VolumeGroupSnapshot
-		existingVGSC     *volumegroupsnapshotv1.VolumeGroupSnapshotContent
-		expectVGSCDelete bool
-		expectVGSDelete  bool
-	}{
-		{
-			name:             "deletes both VGSC and VGS",
-			vgs:              makeVGS("test-vgs", "ns", ptr.To("test-vgsc")),
-			existingVGSC:     makeVGSC("test-vgsc"),
-			expectVGSCDelete: true,
-			expectVGSDelete:  true,
-		},
-		{
-			name:             "VGSC not found, still deletes VGS",
-			vgs:              makeVGS("test-vgs", "ns", ptr.To("missing-vgsc")),
-			existingVGSC:     nil,
-			expectVGSCDelete: false,
-			expectVGSDelete:  true,
-		},
-		{
-			name:             "no BoundVGSCName set, only deletes VGS",
-			vgs:              makeVGS("test-vgs", "ns", nil),
-			existingVGSC:     nil,
-			expectVGSCDelete: false,
-			expectVGSDelete:  true,
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			var objs []runtime.Object
-			objs = append(objs, tt.vgs)
-			if tt.existingVGSC != nil {
-				objs = append(objs, tt.existingVGSC)
-			}
-
-			crClient := velerotest.NewFakeControllerRuntimeClientWithVGS(t, objs...)
-			action := &pvcBackupItemAction{
-				log:      velerotest.NewLogger(),
-				crClient: crClient,
-			}
-
-			err := action.deleteVGSAndVGSC(t.Context(), tt.vgs)
-			require.NoError(t, err)
-
-			// Check VGSC is deleted
-			if tt.expectVGSCDelete {
-				_, err = csi.GetVGSC(t.Context(), crClient, "test-vgsc")
-				assert.True(t, apierrors.IsNotFound(err), "expected VGSC to be deleted")
-			}
-
-			// Check VGS is deleted
-			_, err = csi.GetVGS(t.Context(), crClient, "ns", "test-vgs")
-			assert.True(t, apierrors.IsNotFound(err), "expected VGS to be deleted")
 		})
 	}
 }

@@ -20,10 +20,15 @@ import (
 	"testing"
 
 	volumegroupsnapshotv1 "github.com/kubernetes-csi/external-snapshotter/client/v8/apis/volumegroupsnapshot/v1"
+	snapshotv1 "github.com/kubernetes-csi/external-snapshotter/client/v8/apis/volumesnapshot/v1"
+	"github.com/sirupsen/logrus"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	corev1api "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	crclient "sigs.k8s.io/controller-runtime/pkg/client"
 
+	velerov1 "github.com/vmware-tanzu/velero/pkg/apis/velero/v1"
 	velerotest "github.com/vmware-tanzu/velero/pkg/test"
 	"github.com/vmware-tanzu/velero/pkg/util/csi"
 )
@@ -98,6 +103,46 @@ func TestVGSHelpersRoundTrip(t *testing.T) {
 	// Delete VGS
 	require.NoError(t, csi.DeleteVGS(t.Context(), c, "ns-1", "vgs-1"))
 	_, err = csi.GetVGS(t.Context(), c, "ns-1", "vgs-1")
+	require.Error(t, err)
+}
+
+func TestCleanupBackupVolumeGroupSnapshots(t *testing.T) {
+	backup := &velerov1.Backup{
+		ObjectMeta: metav1.ObjectMeta{Name: "backup", Namespace: "velero", UID: "backup-uid"},
+		Spec:       velerov1.BackupSpec{VolumeGroupSnapshotLabelKey: "velero.io/volume-group"},
+		Status:     velerov1.BackupStatus{Phase: velerov1.BackupPhaseCompleted},
+	}
+	groupContentName := "group-content"
+	group := &volumegroupsnapshotv1.VolumeGroupSnapshot{
+		ObjectMeta: metav1.ObjectMeta{Name: "group", Namespace: "app", UID: "group-uid", Labels: map[string]string{
+			velerov1.BackupNameLabel: "backup", velerov1.BackupUIDLabel: "backup-uid",
+		}},
+		Status: &volumegroupsnapshotv1.VolumeGroupSnapshotStatus{BoundVolumeGroupSnapshotContentName: &groupContentName},
+	}
+	content := &volumegroupsnapshotv1.VolumeGroupSnapshotContent{
+		ObjectMeta: metav1.ObjectMeta{Name: groupContentName},
+		Spec: volumegroupsnapshotv1.VolumeGroupSnapshotContentSpec{
+			DeletionPolicy:         snapshotv1.VolumeSnapshotContentRetain,
+			VolumeGroupSnapshotRef: corev1api.ObjectReference{Name: group.Name, Namespace: group.Namespace, UID: group.UID},
+		},
+	}
+	orphanContent := &volumegroupsnapshotv1.VolumeGroupSnapshotContent{
+		ObjectMeta: metav1.ObjectMeta{Name: "orphan-content", Labels: map[string]string{
+			velerov1.BackupUIDLabel: string(backup.UID),
+		}},
+		Spec: volumegroupsnapshotv1.VolumeGroupSnapshotContentSpec{DeletionPolicy: snapshotv1.VolumeSnapshotContentDelete},
+	}
+	client := velerotest.NewFakeControllerRuntimeClientWithVGS(t, backup, group, content, orphanContent)
+	require.NoError(t, csi.EnsureVGSBackupFinalizer(t.Context(), backup, client))
+	updatedBackup := &velerov1.Backup{}
+	require.NoError(t, client.Get(t.Context(), crclient.ObjectKeyFromObject(backup), updatedBackup))
+	assert.Contains(t, updatedBackup.Finalizers, csi.VGSBackupFinalizer)
+	require.NoError(t, csi.CleanupBackupVolumeGroupSnapshots(t.Context(), backup, client, logrus.New()))
+	_, err := csi.GetVGS(t.Context(), client, group.Namespace, group.Name)
+	require.Error(t, err)
+	_, err = csi.GetVGSC(t.Context(), client, groupContentName)
+	require.Error(t, err)
+	_, err = csi.GetVGSC(t.Context(), client, orphanContent.Name)
 	require.Error(t, err)
 }
 
