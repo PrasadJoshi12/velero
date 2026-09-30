@@ -104,6 +104,8 @@ The VGS backup workflow is triggered by a simple label on your PVCs.
 
 4.  **Resource Cleanup:** Velero keeps the temporary `VolumeGroupSnapshot` and `VolumeGroupSnapshotContent` resources while the Backup processes and finalizes the individual `VolumeSnapshots`. After the Backup reaches a terminal phase and its archive is persisted, Velero retains the backend snapshot data, deletes the VGS/VGSC API resources, and completes cleanup.
 
+    While the parent VGS exists, external-snapshotter may keep VGS member `VolumeSnapshot` objects in `Terminating` while its protection finalizers are processed. This is expected; terminal VGS cleanup releases the member snapshots after Backup finalization.
+
 Here is a visual representation of the backup workflow:
 
 ![VGS Backup Workflow](/img/vgs-flow.svg)
