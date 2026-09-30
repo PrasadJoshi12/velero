@@ -31,7 +31,6 @@ import (
 	clocks "k8s.io/utils/clock"
 	ctrl "sigs.k8s.io/controller-runtime"
 	kbclient "sigs.k8s.io/controller-runtime/pkg/client"
-	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 
 	velerov1api "github.com/vmware-tanzu/velero/pkg/apis/velero/v1"
 	pkgbackup "github.com/vmware-tanzu/velero/pkg/backup"
@@ -120,28 +119,14 @@ func (r *backupFinalizerReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 		log.WithError(err).Error("Error getting Backup")
 		return ctrl.Result{}, errors.WithStack(err)
 	}
-	if !backup.DeletionTimestamp.IsZero() && controllerutil.ContainsFinalizer(backup, csi.VGSBackupFinalizer) &&
-		backup.Status.Phase != velerov1api.BackupPhaseCompleted &&
-		backup.Status.Phase != velerov1api.BackupPhasePartiallyFailed &&
-		backup.Status.Phase != velerov1api.BackupPhaseFailed {
-		return ctrl.Result{}, errors.New("Backup deletion is waiting for the backup to reach a terminal phase before VolumeGroupSnapshot cleanup")
-	}
-
 	switch backup.Status.Phase {
 	case velerov1api.BackupPhaseCompleted, velerov1api.BackupPhasePartiallyFailed, velerov1api.BackupPhaseFailed:
 		// Terminal status is persisted only after the finalized archive has been
 		// uploaded. Run group cleanup on this subsequent reconciliation so a
 		// cleanup failure/restart retries deletion, not archive generation using
 		// snapshots that may already have been deleted.
-		if controllerutil.ContainsFinalizer(backup, csi.VGSBackupFinalizer) {
-			if err := csi.CleanupBackupVolumeGroupSnapshots(ctx, backup, r.globalCRClient, log); err != nil {
-				return ctrl.Result{}, err
-			}
-			if controllerutil.ContainsFinalizer(backup, csi.VGSBackupFinalizer) {
-				base := backup.DeepCopy()
-				controllerutil.RemoveFinalizer(backup, csi.VGSBackupFinalizer)
-				return ctrl.Result{}, r.client.Patch(ctx, backup, kbclient.MergeFrom(base))
-			}
+		if err := csi.CleanupBackupVolumeGroupSnapshots(ctx, backup, r.globalCRClient, log); err != nil {
+			return ctrl.Result{}, err
 		}
 		return ctrl.Result{}, nil
 	case velerov1api.BackupPhaseFinalizing, velerov1api.BackupPhaseFinalizingPartiallyFailed:

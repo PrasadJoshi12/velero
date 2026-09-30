@@ -165,6 +165,12 @@ func DeleteVolumeSnapshotContentIfAny(
 // disappearance and returns errors on any failure.
 func EnsureDeleteVS(ctx context.Context, snapshotClient snapshotter.SnapshotV1Interface,
 	vsName string, vsNamespace string, timeout time.Duration) error {
+	if vs, err := snapshotClient.VolumeSnapshots(vsNamespace).Get(ctx, vsName, metav1.GetOptions{}); err == nil &&
+		vs.Status != nil && vs.Status.VolumeGroupSnapshotName != nil {
+		// The external-snapshotter controller defers member deletion while the
+		// parent VGS exists. Terminal VGS cleanup owns this deletion.
+		return nil
+	}
 	err := snapshotClient.VolumeSnapshots(vsNamespace).Delete(ctx, vsName, metav1.DeleteOptions{})
 	if err != nil {
 		return errors.Wrap(err, "error to delete volume snapshot")
@@ -230,6 +236,12 @@ func RemoveVSCProtect(ctx context.Context, snapshotClient snapshotter.SnapshotV1
 // disappearance and returns errors on any failure.
 func EnsureDeleteVSC(ctx context.Context, snapshotClient snapshotter.SnapshotV1Interface,
 	vscName string, timeout time.Duration) error {
+	if vsc, err := snapshotClient.VolumeSnapshotContents().Get(ctx, vscName, metav1.GetOptions{}); err == nil &&
+		vsc.Status != nil && vsc.Status.VolumeGroupSnapshotHandle != nil {
+		// Group-member content is deleted by terminal VGS cleanup, not through
+		// an individual VolumeSnapshotContent deletion.
+		return nil
+	}
 	err := snapshotClient.VolumeSnapshotContents().Delete(ctx, vscName, metav1.DeleteOptions{})
 	if err != nil && !apierrors.IsNotFound(err) {
 		return errors.Wrap(err, "error to delete volume snapshot content")
@@ -276,6 +288,11 @@ func DeleteVolumeSnapshotIfAny(
 	vsNamespace string,
 	log logrus.FieldLogger,
 ) {
+	if vs, err := snapshotClient.VolumeSnapshots(vsNamespace).Get(ctx, vsName, metav1.GetOptions{}); err == nil &&
+		vs.Status != nil && vs.Status.VolumeGroupSnapshotName != nil {
+		log.Warnf("Deferring deletion of VGS member VolumeSnapshot %s/%s until VGS cleanup", vsNamespace, vsName)
+		return
+	}
 	err := snapshotClient.VolumeSnapshots(vsNamespace).Delete(ctx, vsName, metav1.DeleteOptions{})
 	if err != nil {
 		if apierrors.IsNotFound(err) {
@@ -580,6 +597,10 @@ func CleanupVolumeSnapshot(
 	)
 	if err != nil {
 		log.Debugf("Failed to get volumesnapshot %s/%s", volSnap.Namespace, volSnap.Name)
+		return
+	}
+	if vs.Status != nil && vs.Status.VolumeGroupSnapshotName != nil {
+		log.Warnf("Deferring deletion of VGS member VolumeSnapshot %s/%s until VGS cleanup", vs.Namespace, vs.Name)
 		return
 	}
 

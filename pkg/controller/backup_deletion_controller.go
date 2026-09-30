@@ -36,7 +36,6 @@ import (
 	"k8s.io/utils/clock"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
-	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 
 	"github.com/vmware-tanzu/velero/internal/credentials"
 	"github.com/vmware-tanzu/velero/internal/delete"
@@ -184,11 +183,6 @@ func (r *backupDeletionReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 	} else if err != nil {
 		return ctrl.Result{}, errors.Wrap(err, "error getting backup")
 	}
-	if controllerutil.ContainsFinalizer(backup, csi.VGSBackupFinalizer) {
-		err := r.patchDeleteBackupRequestWithError(ctx, dbr, errors.Errorf("backup is waiting for VolumeGroupSnapshot cleanup"))
-		return ctrl.Result{}, err
-	}
-
 	// Don't allow deleting backups in read-only storage locations
 	location := &velerov1api.BackupStorageLocation{}
 	if err := r.Get(context.Background(), client.ObjectKey{
@@ -276,6 +270,9 @@ func (r *backupDeletionReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 			// for backups which failed before tarball object could be uploaded we do offline cleanup
 			log.Info("Cleaning up CSI volumesnapshots")
 			r.deleteCSIVolumeSnapshotsIfAny(ctx, backup, log)
+			if err := csi.CleanupBackupVolumeGroupSnapshots(ctx, backup, r.Client, log); err != nil {
+				log.WithError(err).Warn("Could not clean up VolumeGroupSnapshots")
+			}
 
 			// If the tarball simply does not exist (HTTP 404 / not found), the download
 			// failure is permanent and not retryable, so we let deletion proceed.

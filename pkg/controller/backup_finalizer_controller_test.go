@@ -68,9 +68,9 @@ func mockBackupFinalizerReconciler(fakeClient kbclient.Client, fakeGlobalClient 
 	), backupper
 }
 
-func TestBackupFinalizerReconcileRemovesVGSFinalizerAfterTerminalCleanup(t *testing.T) {
+func TestBackupFinalizerReconcileRunsTerminalVGSCleanup(t *testing.T) {
 	backup := builder.ForBackup(velerov1api.DefaultNamespace, "backup-1").
-		ObjectMeta(builder.WithUID("backup-uid"), builder.WithFinalizers(csi.VGSBackupFinalizer)).
+		ObjectMeta(builder.WithUID("backup-uid")).
 		Phase(velerov1api.BackupPhaseCompleted).Result()
 	client := velerotest.NewFakeControllerRuntimeClient(t, backup)
 	reconciler := &backupFinalizerReconciler{
@@ -87,13 +87,13 @@ func TestBackupFinalizerReconcileRemovesVGSFinalizerAfterTerminalCleanup(t *test
 
 	updated := &velerov1api.Backup{}
 	require.NoError(t, client.Get(t.Context(), kbclient.ObjectKeyFromObject(backup), updated))
-	assert.NotContains(t, updated.Finalizers, csi.VGSBackupFinalizer)
+	assert.Empty(t, updated.Finalizers)
 }
 
 func TestBackupFinalizerReconcileCleansVGSAfterFailedBackup(t *testing.T) {
 	contentName := "group-content"
 	backup := builder.ForBackup(velerov1api.DefaultNamespace, "backup-failed").
-		ObjectMeta(builder.WithUID("backup-uid"), builder.WithFinalizers(csi.VGSBackupFinalizer)).
+		ObjectMeta(builder.WithUID("backup-uid")).
 		Phase(velerov1api.BackupPhaseFailed).Result()
 	group := &volumegroupsnapshotv1.VolumeGroupSnapshot{
 		ObjectMeta: metav1.ObjectMeta{
@@ -136,11 +136,10 @@ func TestBackupFinalizerReconcileCleansVGSAfterFailedBackup(t *testing.T) {
 
 	updated := &velerov1api.Backup{}
 	require.NoError(t, client.Get(t.Context(), kbclient.ObjectKeyFromObject(backup), updated))
-	assert.NotContains(t, updated.Finalizers, csi.VGSBackupFinalizer)
 	_, err = csi.GetVGS(t.Context(), globalClient, group.Namespace, group.Name)
-	assert.Error(t, err)
+	require.Error(t, err)
 	_, err = csi.GetVGSC(t.Context(), globalClient, contentName)
-	assert.Error(t, err)
+	require.Error(t, err)
 }
 
 func TestBackupFinalizerReconcile(t *testing.T) {

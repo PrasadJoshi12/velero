@@ -1516,9 +1516,6 @@ func TestCreateVolumeGroupSnapshot(t *testing.T) {
 	vgs, err := action.createVolumeGroupSnapshot(t.Context(), testBackup, testPVC, testLabelKey, testLabelValue, testVGSClass)
 	require.NoError(t, err)
 	require.NotNil(t, vgs)
-	updatedBackup := &velerov1api.Backup{}
-	require.NoError(t, crClient.Get(t.Context(), crclient.ObjectKeyFromObject(testBackup), updatedBackup))
-	assert.Contains(t, updatedBackup.Finalizers, csi.VGSBackupFinalizer)
 
 	// Verify VGS fields
 	assert.Equal(t, testNamespace, vgs.Namespace)
@@ -1725,10 +1722,7 @@ func TestUpdateVGSCreatedVS(t *testing.T) {
 				Name:            name,
 				Namespace:       vgs.Namespace,
 				OwnerReferences: refs,
-				Finalizers: []string{
-					VolumeSnapshotFinalizerGroupProtection,
-					VolumeSnapshotFinalizerSourceProtection,
-				},
+				Finalizers:      []string{"group-protection", "source-protection"},
 			},
 			Status: &snapshotv1api.VolumeSnapshotStatus{
 				ReadyToUse:              ptr.To(true),
@@ -1750,10 +1744,10 @@ func TestUpdateVGSCreatedVS(t *testing.T) {
 		expectLabelPatched      bool
 	}{
 		{
-			name:                    "should update owned VS",
+			name:                    "should label owned VS",
 			vs:                      makeVS("vs-owned", true, ptr.To(vgs.Name), "pvc-1"),
-			expectOwnerCleared:      true,
-			expectFinalizersCleared: true,
+			expectOwnerCleared:      false,
+			expectFinalizersCleared: false,
 			expectLabelPatched:      true,
 		},
 		{

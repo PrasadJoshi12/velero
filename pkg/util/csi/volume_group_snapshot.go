@@ -25,45 +25,21 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/client-go/util/retry"
 	crclient "sigs.k8s.io/controller-runtime/pkg/client"
-	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 
 	velerov1 "github.com/vmware-tanzu/velero/pkg/apis/velero/v1"
 	"github.com/vmware-tanzu/velero/pkg/label"
 	kubeutil "github.com/vmware-tanzu/velero/pkg/util/kube"
 )
 
-const VGSBackupFinalizer = "velero.io/volume-group-snapshot-cleanup"
-
-func EnsureVGSBackupFinalizer(ctx context.Context, backup *velerov1.Backup, c crclient.Client) error {
-	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
-		current := &velerov1.Backup{}
-		if err := c.Get(ctx, crclient.ObjectKeyFromObject(backup), current); err != nil {
-			return err
-		}
-		if current.UID != backup.UID || !current.DeletionTimestamp.IsZero() {
-			return errors.New("backup changed or is being deleted")
-		}
-		if controllerutil.ContainsFinalizer(current, VGSBackupFinalizer) {
-			return nil
-		}
-		base := current.DeepCopy()
-		controllerutil.AddFinalizer(current, VGSBackupFinalizer)
-		return c.Patch(ctx, current, crclient.MergeFrom(base))
-	})
-}
-
-// CleanupBackupVolumeGroupSnapshots removes temporary group snapshot API objects
-// after the finalized backup is persisted. Cleanup is idempotent and errors are
-// returned so the terminal-backup reconciliation can retry.
+// CleanupBackupVolumeGroupSnapshots removes group snapshot API objects associated
+// with a Backup. Cleanup is idempotent and errors are returned to the caller so
+// normal Backup reconciliation or offline deletion cleanup can report them.
 func CleanupBackupVolumeGroupSnapshots(ctx context.Context, backup *velerov1.Backup, client crclient.Client, log logrus.FieldLogger) error {
-	if backup.UID == "" || (backup.Status.Phase != velerov1.BackupPhaseCompleted && backup.Status.Phase != velerov1.BackupPhasePartiallyFailed && backup.Status.Phase != velerov1.BackupPhaseFailed) {
+	if backup.UID == "" {
 		return nil
 	}
 
-	groups, err := ListVGS(ctx, client, "", map[string]string{
-		velerov1.BackupNameLabel: label.GetValidName(backup.Name),
-		velerov1.BackupUIDLabel:  string(backup.UID),
-	})
+	groups, err := ListVGS(ctx, client, "", map[string]string{velerov1.BackupUIDLabel: string(backup.UID)})
 	if err != nil {
 		if errors.Is(err, ErrVGSAPINotAvailable) {
 			return nil
@@ -74,9 +50,11 @@ func CleanupBackupVolumeGroupSnapshots(ctx context.Context, backup *velerov1.Bac
 	if err != nil && !errors.Is(err, ErrVGSAPINotAvailable) {
 		return errors.Wrap(err, "listing backup VolumeGroupSnapshotContents")
 	}
+	processedContents := map[string]struct{}{}
 	if err == nil {
 		for i := range contents.Items {
 			content := &contents.Items[i]
+			processedContents[content.Name] = struct{}{}
 			content.Spec.DeletionPolicy = snapshotv1.VolumeSnapshotContentRetain
 			if _, err := UpdateVGSC(ctx, client, content); err != nil {
 				return errors.Wrapf(err, "retaining VolumeGroupSnapshotContent %s", content.Name)
@@ -90,8 +68,13 @@ func CleanupBackupVolumeGroupSnapshots(ctx context.Context, backup *velerov1.Bac
 	for i := range groups.Items {
 		group := &groups.Items[i]
 		if group.Status != nil && group.Status.BoundVolumeGroupSnapshotContentName != nil {
+			contentName := *group.Status.BoundVolumeGroupSnapshotContentName
+			_, processed := processedContents[contentName]
 			err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
-				content, err := GetVGSC(ctx, client, *group.Status.BoundVolumeGroupSnapshotContentName)
+				if processed {
+					return nil
+				}
+				content, err := GetVGSC(ctx, client, contentName)
 				if err != nil {
 					if apierrors.IsNotFound(err) {
 						return nil
@@ -121,20 +104,6 @@ func CleanupBackupVolumeGroupSnapshots(ctx context.Context, backup *velerov1.Bac
 		if err := DeleteVGS(ctx, client, group.Namespace, group.Name); err != nil && !apierrors.IsNotFound(err) {
 			return errors.Wrapf(err, "deleting VolumeGroupSnapshot %s/%s", group.Namespace, group.Name)
 		}
-	}
-	remaining, err := ListVGS(ctx, client, "", map[string]string{velerov1.BackupUIDLabel: string(backup.UID)})
-	if err != nil && !errors.Is(err, ErrVGSAPINotAvailable) {
-		return errors.Wrap(err, "verifying VolumeGroupSnapshot cleanup")
-	}
-	if err == nil && len(remaining.Items) > 0 {
-		return errors.New("VolumeGroupSnapshot cleanup is still pending")
-	}
-	remainingContents, err := ListVGSC(ctx, client, map[string]string{velerov1.BackupUIDLabel: string(backup.UID)})
-	if err != nil && !errors.Is(err, ErrVGSAPINotAvailable) {
-		return errors.Wrap(err, "verifying VolumeGroupSnapshotContent cleanup")
-	}
-	if err == nil && len(remainingContents.Items) > 0 {
-		return errors.New("VolumeGroupSnapshotContent cleanup is still pending")
 	}
 	return nil
 }

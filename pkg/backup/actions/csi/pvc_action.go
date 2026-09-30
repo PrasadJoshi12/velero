@@ -40,7 +40,6 @@ import (
 	_ "k8s.io/client-go/plugin/pkg/client/auth/gcp"
 	"k8s.io/client-go/util/retry"
 	crclient "sigs.k8s.io/controller-runtime/pkg/client"
-	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 
 	veleroshared "github.com/vmware-tanzu/velero/pkg/apis/velero/shared"
 	velerov1api "github.com/vmware-tanzu/velero/pkg/apis/velero/v1"
@@ -60,15 +59,6 @@ import (
 	kubeutil "github.com/vmware-tanzu/velero/pkg/util/kube"
 	podvolumeutil "github.com/vmware-tanzu/velero/pkg/util/podvolume"
 	vhutil "github.com/vmware-tanzu/velero/pkg/util/volumehelper"
-)
-
-// TODO: Replace hardcoded VolumeSnapshot finalizer strings with constants from
-// "github.com/kubernetes-csi/external-snapshotter/v8/pkg/utils"
-// once module/toolchain upgrades are done.
-// Finalizer constants
-const (
-	VolumeSnapshotFinalizerGroupProtection  = "snapshot.storage.kubernetes.io/volumesnapshot-in-group-protection"
-	VolumeSnapshotFinalizerSourceProtection = "snapshot.storage.kubernetes.io/volumesnapshot-as-source-protection"
 )
 
 // pvcBackupItemAction is a backup item action plugin for Velero.
@@ -430,9 +420,11 @@ func (p *pvcBackupItemAction) Execute(
 		if err != nil {
 			dataUploadLog.WithError(err).Error("failed to submit DataUpload")
 
-			// TODO: need to use DeleteVolumeSnapshotIfAny, after data mover
-			// adopting the controller-runtime client.
-			if deleteErr := p.crClient.Delete(ctx, vs); deleteErr != nil {
+			// External-snapshotter blocks deletion of a VGS member while its
+			// parent still exists. Terminal VGS cleanup will release it.
+			if vs.Status != nil && vs.Status.VolumeGroupSnapshotName != nil {
+				dataUploadLog.Warn("deferring VGS member VolumeSnapshot deletion until VGS cleanup")
+			} else if deleteErr := p.crClient.Delete(ctx, vs); deleteErr != nil {
 				if !apierrors.IsNotFound(deleteErr) {
 					dataUploadLog.WithError(deleteErr).Error("fail to delete VolumeSnapshot")
 				}
@@ -830,11 +822,10 @@ func (p *pvcBackupItemAction) getVolumeSnapshotReference(
 			return nil, errors.Wrapf(err, "failed to patch VolumeGroupSnapshotContent Deletion Policy for VolumeGroupSnapshot %s", newVGS.Name)
 		}
 
-		// Keep the group until the backup archive has been finalized. The external-
-		// snapshotter controller explicitly deletes every member VolumeSnapshot when
-		// a VolumeGroupSnapshot is deleted, independent of owner references and the
-		// VGSC deletion policy. Deleting here races with backing up the remaining
-		// PVCs and polling the VolumeSnapshot async operations.
+		// Keep the group until the backup archive has been finalized. External-
+		// snapshotter blocks individual member VolumeSnapshot deletion while the
+		// parent VGS exists, and deleting the group here can cascade cleanup before
+		// the remaining PVCs and CSI async operations have been processed.
 
 		// Use the VS that was created for this PVC via VGS.
 		vs, found := vsMap[pvc.Name]
@@ -1024,9 +1015,6 @@ func (p *pvcBackupItemAction) createVolumeGroupSnapshot(
 		},
 	}
 
-	if err := csi.EnsureVGSBackupFinalizer(ctx, backup, p.crClient); err != nil {
-		return nil, errors.Wrap(err, "failed to protect backup from deletion while VolumeGroupSnapshot is in use")
-	}
 	if _, err := csi.CreateVGS(ctx, p.crClient, vgs); err != nil {
 		return nil, errors.Wrap(err, "failed to create VolumeGroupSnapshot")
 	}
@@ -1101,20 +1089,6 @@ func hasOwnerReference(obj metav1.Object, vgs *volumegroupsnapshotv1.VolumeGroup
 	return false
 }
 
-// removeVGSOwnerReference strips any owner reference pointing at the given VGS
-// (matched by Kind + UID, version-independent).
-func removeVGSOwnerReference(obj metav1.Object, vgs *volumegroupsnapshotv1.VolumeGroupSnapshot) {
-	refs := obj.GetOwnerReferences()
-	kept := make([]metav1.OwnerReference, 0, len(refs))
-	for _, ref := range refs {
-		if ref.Kind == kuberesource.VGSKind && ref.UID == vgs.UID {
-			continue
-		}
-		kept = append(kept, ref)
-	}
-	obj.SetOwnerReferences(kept)
-}
-
 func (p *pvcBackupItemAction) updateVGSCreatedVS(
 	ctx context.Context,
 	vsMap map[string]*snapshotv1api.VolumeSnapshot,
@@ -1133,13 +1107,6 @@ func (p *pvcBackupItemAction) updateVGSCreatedVS(
 			if err := p.crClient.Get(ctx, crclient.ObjectKeyFromObject(vs), latestVS); err != nil {
 				return errors.Wrapf(err, "failed to get latest VolumeSnapshot %s (PVC %s)", vs.Name, pvcName)
 			}
-
-			// Remove VGS owner ref (matched by Kind + UID, version-independent)
-			removeVGSOwnerReference(latestVS, vgs)
-
-			// Remove known finalizers
-			controllerutil.RemoveFinalizer(latestVS, VolumeSnapshotFinalizerGroupProtection)
-			controllerutil.RemoveFinalizer(latestVS, VolumeSnapshotFinalizerSourceProtection)
 
 			// Add Velero labels
 			if latestVS.Labels == nil {

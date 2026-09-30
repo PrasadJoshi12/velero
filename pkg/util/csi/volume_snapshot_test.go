@@ -35,6 +35,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	clientTesting "k8s.io/client-go/testing"
+	"k8s.io/utils/ptr"
 	crclient "sigs.k8s.io/controller-runtime/pkg/client"
 
 	velerov1api "github.com/vmware-tanzu/velero/pkg/apis/velero/v1"
@@ -314,6 +315,11 @@ func TestEnsureDeleteVS(t *testing.T) {
 			Finalizers: []string{"fake-finalizer-1", "fake-finalizer-2"},
 		},
 	}
+	groupMemberName := "group"
+	vsGroupMember := &snapshotv1api.VolumeSnapshot{
+		ObjectMeta: metav1.ObjectMeta{Name: "fake-vs", Namespace: "fake-ns"},
+		Status:     &snapshotv1api.VolumeSnapshotStatus{VolumeGroupSnapshotName: &groupMemberName},
+	}
 
 	tests := []struct {
 		name      string
@@ -406,6 +412,12 @@ func TestEnsureDeleteVS(t *testing.T) {
 			namespace: "fake-ns",
 			clientObj: []runtime.Object{vsObj},
 		},
+		{
+			name:      "defer VGS member",
+			vsName:    "fake-vs",
+			namespace: "fake-ns",
+			clientObj: []runtime.Object{vsGroupMember},
+		},
 	}
 
 	for _, test := range tests {
@@ -438,6 +450,10 @@ func TestEnsureDeleteVSC(t *testing.T) {
 			Name:       "fake-vsc",
 			Finalizers: []string{"fake-finalizer-1", "fake-finalizer-2"},
 		},
+	}
+	vscGroupMember := &snapshotv1api.VolumeSnapshotContent{
+		ObjectMeta: metav1.ObjectMeta{Name: "fake-vsc"},
+		Status:     &snapshotv1api.VolumeSnapshotContentStatus{VolumeGroupSnapshotHandle: ptr.To("group-handle")},
 	}
 
 	tests := []struct {
@@ -537,6 +553,11 @@ func TestEnsureDeleteVSC(t *testing.T) {
 			name:      "success",
 			vscName:   "fake-vsc",
 			clientObj: []runtime.Object{vscObj},
+		},
+		{
+			name:      "defer group member",
+			vscName:   "fake-vsc",
+			clientObj: []runtime.Object{vscGroupMember},
 		},
 	}
 
@@ -1578,7 +1599,7 @@ func TestSetVolumeSnapshotContentDeletionPolicy(t *testing.T) {
 			fakeClient := velerotest.NewFakeControllerRuntimeClient(t, tc.objs...)
 			_, err := SetVolumeSnapshotContentDeletionPolicy(context.TODO(), tc.inputVSCName, fakeClient, tc.policy)
 			if tc.expectError {
-				assert.Error(t, err)
+				require.Error(t, err)
 			} else {
 				require.NoError(t, err)
 				actual := new(snapshotv1api.VolumeSnapshotContent)
@@ -2250,6 +2271,21 @@ func TestCleanupVolumeSnapshot(t *testing.T) {
 			},
 			expectDeleted: true,
 			expectedVSC:   "retain-vsc",
+		},
+		{
+			name: "should defer deletion for a VGS member",
+			volSnap: &snapshotv1api.VolumeSnapshot{
+				ObjectMeta: metav1.ObjectMeta{Name: "vgs-member", Namespace: "velero"},
+			},
+			objs: []runtime.Object{
+				&snapshotv1api.VolumeSnapshot{
+					ObjectMeta: metav1.ObjectMeta{Name: "vgs-member", Namespace: "velero"},
+					Status: &snapshotv1api.VolumeSnapshotStatus{
+						VolumeGroupSnapshotName: ptr.To("group"),
+					},
+				},
+			},
+			expectDeleted: false,
 		},
 	}
 
