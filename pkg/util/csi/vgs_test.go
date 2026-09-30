@@ -17,20 +17,50 @@ limitations under the License.
 package csi_test
 
 import (
+	"context"
 	"testing"
 
+	"github.com/cockroachdb/errors"
 	volumegroupsnapshotv1 "github.com/kubernetes-csi/external-snapshotter/client/v8/apis/volumegroupsnapshot/v1"
 	snapshotv1 "github.com/kubernetes-csi/external-snapshotter/client/v8/apis/volumesnapshot/v1"
 	"github.com/sirupsen/logrus"
-	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	corev1api "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	crclient "sigs.k8s.io/controller-runtime/pkg/client"
 
 	velerov1 "github.com/vmware-tanzu/velero/pkg/apis/velero/v1"
 	velerotest "github.com/vmware-tanzu/velero/pkg/test"
 	"github.com/vmware-tanzu/velero/pkg/util/csi"
 )
+
+type failingVGSClient struct {
+	crclient.Client
+	listErr   error
+	updateErr error
+	deleteErr error
+}
+
+func (c *failingVGSClient) List(ctx context.Context, list crclient.ObjectList, opts ...crclient.ListOption) error {
+	if c.listErr != nil {
+		return c.listErr
+	}
+	return c.Client.List(ctx, list, opts...)
+}
+
+func (c *failingVGSClient) Update(ctx context.Context, obj crclient.Object, opts ...crclient.UpdateOption) error {
+	if c.updateErr != nil {
+		return c.updateErr
+	}
+	return c.Client.Update(ctx, obj, opts...)
+}
+
+func (c *failingVGSClient) Delete(ctx context.Context, obj crclient.Object, opts ...crclient.DeleteOption) error {
+	if c.deleteErr != nil {
+		return c.deleteErr
+	}
+	return c.Client.Delete(ctx, obj, opts...)
+}
 
 func TestResolveVGSGroupVersion(t *testing.T) {
 	tests := []struct {
@@ -60,8 +90,8 @@ func TestResolveVGSGroupVersion(t *testing.T) {
 				require.Error(t, err)
 			default:
 				require.NoError(t, err)
-				assert.Equal(t, csi.VGSGroup, gv.Group)
-				assert.Equal(t, tt.expectVer, gv.Version)
+				require.Equal(t, csi.VGSGroup, gv.Group)
+				require.Equal(t, tt.expectVer, gv.Version)
 			}
 		})
 	}
@@ -84,7 +114,7 @@ func TestVGSHelpersRoundTrip(t *testing.T) {
 	classes, err := csi.ListVGSClasses(t.Context(), c)
 	require.NoError(t, err)
 	require.Len(t, classes.Items, 1)
-	assert.Equal(t, "rbd.csi.ceph.com", classes.Items[0].Driver)
+	require.Equal(t, "rbd.csi.ceph.com", classes.Items[0].Driver)
 
 	// Create + Get VGS
 	created, err := csi.CreateVGS(t.Context(), c, &volumegroupsnapshotv1.VolumeGroupSnapshot{
@@ -92,12 +122,12 @@ func TestVGSHelpersRoundTrip(t *testing.T) {
 		Spec:       volumegroupsnapshotv1.VolumeGroupSnapshotSpec{VolumeGroupSnapshotClassName: &className},
 	})
 	require.NoError(t, err)
-	assert.Equal(t, "vgs-1", created.Name)
+	require.Equal(t, "vgs-1", created.Name)
 
 	got, err := csi.GetVGS(t.Context(), c, "ns-1", "vgs-1")
 	require.NoError(t, err)
 	require.NotNil(t, got.Spec.VolumeGroupSnapshotClassName)
-	assert.Equal(t, className, *got.Spec.VolumeGroupSnapshotClassName)
+	require.Equal(t, className, *got.Spec.VolumeGroupSnapshotClassName)
 
 	// Delete VGS
 	require.NoError(t, csi.DeleteVGS(t.Context(), c, "ns-1", "vgs-1"))
@@ -157,6 +187,30 @@ func TestCleanupBackupVolumeGroupSnapshots(t *testing.T) {
 	require.Error(t, err)
 	_, err = csi.GetVGSC(t.Context(), client, processedContent.Name)
 	require.Error(t, err)
+}
+
+func TestCleanupBackupVolumeGroupSnapshotsErrors(t *testing.T) {
+	backup := &velerov1.Backup{ObjectMeta: metav1.ObjectMeta{Name: "backup", UID: "backup-uid"}}
+	base := velerotest.NewFakeControllerRuntimeClientWithVGS(t, backup)
+
+	t.Run("list VGS", func(t *testing.T) {
+		client := &failingVGSClient{Client: base, listErr: errors.New("list failed")}
+		require.ErrorContains(t, csi.CleanupBackupVolumeGroupSnapshots(t.Context(), backup, client, logrus.New()), "listing backup VolumeGroupSnapshots")
+	})
+
+	content := &volumegroupsnapshotv1.VolumeGroupSnapshotContent{
+		ObjectMeta: metav1.ObjectMeta{Name: "content", Labels: map[string]string{velerov1.BackupUIDLabel: string(backup.UID)}},
+		Spec:       volumegroupsnapshotv1.VolumeGroupSnapshotContentSpec{DeletionPolicy: snapshotv1.VolumeSnapshotContentRetain},
+	}
+	t.Run("update VGSC", func(t *testing.T) {
+		client := &failingVGSClient{Client: velerotest.NewFakeControllerRuntimeClientWithVGS(t, backup, content), updateErr: errors.New("update failed")}
+		require.ErrorContains(t, csi.CleanupBackupVolumeGroupSnapshots(t.Context(), backup, client, logrus.New()), "retaining VolumeGroupSnapshotContent")
+	})
+
+	t.Run("delete VGSC", func(t *testing.T) {
+		client := &failingVGSClient{Client: velerotest.NewFakeControllerRuntimeClientWithVGS(t, backup, content), deleteErr: errors.New("delete failed")}
+		require.ErrorContains(t, csi.CleanupBackupVolumeGroupSnapshots(t.Context(), backup, client, logrus.New()), "deleting VolumeGroupSnapshotContent")
+	})
 }
 
 func TestVGSHelpersAPINotAvailable(t *testing.T) {
