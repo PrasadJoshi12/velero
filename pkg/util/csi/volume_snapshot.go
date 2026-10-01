@@ -48,6 +48,7 @@ const (
 	waitInternal                          = 2 * time.Second
 	volumeSnapshotContentProtectFinalizer = "velero.io/volume-snapshot-content-protect-finalizer"
 	VolumeSnapshotInGroupFinalizer        = "snapshot.storage.kubernetes.io/volumesnapshot-in-group-protection"
+	VolumeSnapshotAsSourceFinalizer       = "snapshot.storage.kubernetes.io/volumesnapshot-as-source-protection"
 )
 
 // WaitVolumeSnapshotReady waits a VS to become ready to use until the timeout reaches

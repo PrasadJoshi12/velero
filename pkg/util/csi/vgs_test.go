@@ -181,13 +181,28 @@ func TestCleanupBackupVolumeGroupSnapshots(t *testing.T) {
 		}},
 		Spec: snapshotv1.VolumeSnapshotContentSpec{DeletionPolicy: snapshotv1.VolumeSnapshotContentDelete},
 	}
+	memberVS := &snapshotv1.VolumeSnapshot{
+		ObjectMeta: metav1.ObjectMeta{Name: "member-vs", Namespace: "app", Labels: map[string]string{
+			velerov1.BackupUIDLabel: string(backup.UID),
+		}},
+		Status: &snapshotv1.VolumeSnapshotStatus{
+			VolumeGroupSnapshotName:        &group.Name,
+			BoundVolumeSnapshotContentName: &memberContent.Name,
+		},
+	}
+	ordinaryContent := &snapshotv1.VolumeSnapshotContent{
+		ObjectMeta: metav1.ObjectMeta{Name: "ordinary-content", Labels: map[string]string{
+			velerov1.BackupUIDLabel: string(backup.UID),
+		}},
+		Spec: snapshotv1.VolumeSnapshotContentSpec{DeletionPolicy: snapshotv1.VolumeSnapshotContentDelete},
+	}
 	orphanContent := &volumegroupsnapshotv1.VolumeGroupSnapshotContent{
 		ObjectMeta: metav1.ObjectMeta{Name: "orphan-content", Labels: map[string]string{
 			velerov1.BackupUIDLabel: string(backup.UID),
 		}},
 		Spec: volumegroupsnapshotv1.VolumeGroupSnapshotContentSpec{DeletionPolicy: snapshotv1.VolumeSnapshotContentDelete},
 	}
-	client := velerotest.NewFakeControllerRuntimeClientWithVGS(t, backup, group, content, processedGroup, processedContent, orphanContent, memberContent)
+	client := velerotest.NewFakeControllerRuntimeClientWithVGS(t, backup, group, content, processedGroup, processedContent, orphanContent, memberContent, memberVS, ordinaryContent)
 	require.NoError(t, csi.CleanupBackupVolumeGroupSnapshots(t.Context(), backup, client, logrus.New()))
 	_, err := csi.GetVGS(t.Context(), client, group.Namespace, group.Name)
 	require.Error(t, err)
@@ -200,6 +215,9 @@ func TestCleanupBackupVolumeGroupSnapshots(t *testing.T) {
 	updatedMemberContent := &snapshotv1.VolumeSnapshotContent{}
 	require.NoError(t, client.Get(t.Context(), crclient.ObjectKeyFromObject(memberContent), updatedMemberContent))
 	require.Equal(t, snapshotv1.VolumeSnapshotContentRetain, updatedMemberContent.Spec.DeletionPolicy)
+	updatedOrdinaryContent := &snapshotv1.VolumeSnapshotContent{}
+	require.NoError(t, client.Get(t.Context(), crclient.ObjectKeyFromObject(ordinaryContent), updatedOrdinaryContent))
+	require.Equal(t, snapshotv1.VolumeSnapshotContentDelete, updatedOrdinaryContent.Spec.DeletionPolicy)
 }
 
 func TestCleanupBackupVolumeGroupSnapshotsErrors(t *testing.T) {
@@ -263,8 +281,15 @@ func TestCleanupBackupVolumeGroupSnapshotsErrors(t *testing.T) {
 			ObjectMeta: metav1.ObjectMeta{Name: "member-content", Labels: map[string]string{velerov1.BackupUIDLabel: string(backup.UID)}},
 			Spec:       snapshotv1.VolumeSnapshotContentSpec{DeletionPolicy: snapshotv1.VolumeSnapshotContentDelete},
 		}
+		memberVS := &snapshotv1.VolumeSnapshot{
+			ObjectMeta: metav1.ObjectMeta{Name: "member-vs", Namespace: "app", Labels: map[string]string{velerov1.BackupUIDLabel: string(backup.UID)}},
+			Status: &snapshotv1.VolumeSnapshotStatus{
+				VolumeGroupSnapshotName:        &group.Name,
+				BoundVolumeSnapshotContentName: &memberContent.Name,
+			},
+		}
 		client := &failingVGSClient{
-			Client:          velerotest.NewFakeControllerRuntimeClientWithVGS(t, backup, group, memberContent),
+			Client:          velerotest.NewFakeControllerRuntimeClientWithVGS(t, backup, group, memberContent, memberVS),
 			updateErrByName: map[string]error{memberContent.Name: errors.New("update failed")},
 		}
 		require.ErrorContains(t, csi.CleanupBackupVolumeGroupSnapshots(t.Context(), backup, client, logrus.New()), "retaining VolumeSnapshotContent")

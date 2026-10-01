@@ -125,8 +125,17 @@ func (r *backupFinalizerReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 		// uploaded. Run group cleanup on this subsequent reconciliation so a
 		// cleanup failure/restart retries deletion, not archive generation using
 		// snapshots that may already have been deleted.
-		if err := csi.CleanupBackupVolumeGroupSnapshots(ctx, backup, r.globalCRClient, log); err != nil {
-			return ctrl.Result{}, err
+		if backup.Annotations[velerov1api.VolumeGroupSnapshotBackupAnnotation] == "true" &&
+			backup.Annotations[velerov1api.VolumeGroupSnapshotCleanupCompletedAnnotation] != "true" {
+			if err := csi.CleanupBackupVolumeGroupSnapshots(ctx, backup, r.globalCRClient, log); err != nil {
+				return ctrl.Result{}, err
+			}
+			base := backup.DeepCopy()
+			if backup.Annotations == nil {
+				backup.Annotations = map[string]string{}
+			}
+			backup.Annotations[velerov1api.VolumeGroupSnapshotCleanupCompletedAnnotation] = "true"
+			return ctrl.Result{}, r.client.Patch(ctx, backup, kbclient.MergeFrom(base))
 		}
 		return ctrl.Result{}, nil
 	case velerov1api.BackupPhaseFinalizing, velerov1api.BackupPhaseFinalizingPartiallyFailed:

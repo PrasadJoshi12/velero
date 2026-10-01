@@ -64,6 +64,20 @@ func CleanupBackupVolumeGroupSnapshots(ctx context.Context, backup *velerov1.Bac
 		}
 	}
 
+	memberContentNames := map[string]struct{}{}
+	if groups != nil && len(groups.Items) > 0 {
+		memberVS := &snapshotv1.VolumeSnapshotList{}
+		if err := client.List(ctx, memberVS, crclient.MatchingLabels(map[string]string{velerov1.BackupUIDLabel: string(backup.UID)})); err != nil {
+			cleanupErrs = append(cleanupErrs, errors.Wrap(err, "listing backup VolumeSnapshots"))
+		}
+		for i := range memberVS.Items {
+			vs := &memberVS.Items[i]
+			if vs.Status == nil || vs.Status.VolumeGroupSnapshotName == nil || vs.Status.BoundVolumeSnapshotContentName == nil {
+				continue
+			}
+			memberContentNames[*vs.Status.BoundVolumeSnapshotContentName] = struct{}{}
+		}
+	}
 	memberContents := &snapshotv1.VolumeSnapshotContentList{}
 	if err := client.List(ctx, memberContents, crclient.MatchingLabels(map[string]string{velerov1.BackupUIDLabel: string(backup.UID)})); err != nil {
 		cleanupErrs = append(cleanupErrs, errors.Wrap(err, "listing backup VolumeSnapshotContents"))
@@ -74,6 +88,9 @@ func CleanupBackupVolumeGroupSnapshots(ctx context.Context, backup *velerov1.Bac
 	memberRetentionFailed := false
 	for i := range memberContents.Items {
 		content := &memberContents.Items[i]
+		if _, isMember := memberContentNames[content.Name]; !isMember {
+			continue
+		}
 		if content.Spec.DeletionPolicy == snapshotv1.VolumeSnapshotContentRetain {
 			continue
 		}
@@ -129,7 +146,7 @@ func CleanupBackupVolumeGroupSnapshots(ctx context.Context, backup *velerov1.Bac
 }
 
 func retainAndDeleteVGSC(ctx context.Context, client crclient.Client, contentName string, backup *velerov1.Backup, labelContent bool) error {
-	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
+	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
 		content, err := GetVGSC(ctx, client, contentName)
 		if err != nil {
 			if apierrors.IsNotFound(err) {
@@ -145,11 +162,15 @@ func retainAndDeleteVGSC(ctx context.Context, client crclient.Client, contentNam
 		}
 		content.Spec.DeletionPolicy = snapshotv1.VolumeSnapshotContentRetain
 		if _, err := UpdateVGSC(ctx, client, content); err != nil {
-			return errors.Wrapf(err, "retaining VolumeGroupSnapshotContent %s", content.Name)
-		}
-		if err := DeleteVGSC(ctx, client, content.Name); err != nil && !apierrors.IsNotFound(err) {
-			return errors.Wrapf(err, "deleting VolumeGroupSnapshotContent %s", content.Name)
+			return err
 		}
 		return nil
 	})
+	if err != nil {
+		return errors.Wrapf(err, "retaining VolumeGroupSnapshotContent %s", contentName)
+	}
+	if err := DeleteVGSC(ctx, client, contentName); err != nil && !apierrors.IsNotFound(err) {
+		return errors.Wrapf(err, "deleting VolumeGroupSnapshotContent %s", contentName)
+	}
+	return nil
 }

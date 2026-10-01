@@ -266,8 +266,9 @@ func (p *volumeSnapshotRestoreItemAction) Execute(
 			errors.Wrapf(err, "failed to convert input.Item from unstructured")
 	}
 	// Restored group members are restored as independent VolumeSnapshots. The
-	// source VGS is not restored and cannot release this source-cluster finalizer.
+	// source VGS is not restored and cannot release source-cluster finalizers.
 	controllerutil.RemoveFinalizer(&vs, csiutil.VolumeSnapshotInGroupFinalizer)
+	controllerutil.RemoveFinalizer(&vs, csiutil.VolumeSnapshotAsSourceFinalizer)
 
 	var vsFromBackup snapshotv1api.VolumeSnapshot
 	if err := runtime.DefaultUnstructuredConverter.FromUnstructured(

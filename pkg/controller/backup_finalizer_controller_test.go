@@ -70,7 +70,7 @@ func mockBackupFinalizerReconciler(fakeClient kbclient.Client, fakeGlobalClient 
 
 func TestBackupFinalizerReconcileRunsTerminalVGSCleanup(t *testing.T) {
 	backup := builder.ForBackup(velerov1api.DefaultNamespace, "backup-1").
-		ObjectMeta(builder.WithUID("backup-uid")).
+		ObjectMeta(builder.WithUID("backup-uid"), builder.WithAnnotations(velerov1api.VolumeGroupSnapshotBackupAnnotation, "true")).
 		Phase(velerov1api.BackupPhaseCompleted).Result()
 	client := velerotest.NewFakeControllerRuntimeClient(t, backup)
 	reconciler := &backupFinalizerReconciler{
@@ -87,13 +87,14 @@ func TestBackupFinalizerReconcileRunsTerminalVGSCleanup(t *testing.T) {
 
 	updated := &velerov1api.Backup{}
 	require.NoError(t, client.Get(t.Context(), kbclient.ObjectKeyFromObject(backup), updated))
-	assert.Empty(t, updated.Finalizers)
+	require.Empty(t, updated.Finalizers)
+	require.Equal(t, "true", updated.Annotations[velerov1api.VolumeGroupSnapshotCleanupCompletedAnnotation])
 }
 
 func TestBackupFinalizerReconcileCleansVGSAfterFailedBackup(t *testing.T) {
 	contentName := "group-content"
 	backup := builder.ForBackup(velerov1api.DefaultNamespace, "backup-failed").
-		ObjectMeta(builder.WithUID("backup-uid")).
+		ObjectMeta(builder.WithUID("backup-uid"), builder.WithAnnotations(velerov1api.VolumeGroupSnapshotBackupAnnotation, "true")).
 		Phase(velerov1api.BackupPhaseFailed).Result()
 	group := &volumegroupsnapshotv1.VolumeGroupSnapshot{
 		ObjectMeta: metav1.ObjectMeta{

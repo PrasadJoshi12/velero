@@ -1516,6 +1516,9 @@ func TestCreateVolumeGroupSnapshot(t *testing.T) {
 	vgs, err := action.createVolumeGroupSnapshot(t.Context(), testBackup, testPVC, testLabelKey, testLabelValue, testVGSClass)
 	require.NoError(t, err)
 	require.NotNil(t, vgs)
+	updatedBackup := &velerov1api.Backup{}
+	require.NoError(t, crClient.Get(t.Context(), crclient.ObjectKeyFromObject(testBackup), updatedBackup))
+	require.Equal(t, "true", updatedBackup.Annotations[velerov1api.VolumeGroupSnapshotBackupAnnotation])
 
 	// Verify VGS fields
 	assert.Equal(t, testNamespace, vgs.Namespace)

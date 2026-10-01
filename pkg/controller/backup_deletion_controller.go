@@ -270,9 +270,6 @@ func (r *backupDeletionReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 			// for backups which failed before tarball object could be uploaded we do offline cleanup
 			log.Info("Cleaning up CSI volumesnapshots")
 			r.deleteCSIVolumeSnapshotsIfAny(ctx, backup, log)
-			if err := csi.CleanupBackupVolumeGroupSnapshots(ctx, backup, r.Client, log); err != nil {
-				log.WithError(err).Warn("Could not clean up VolumeGroupSnapshots")
-			}
 
 			// If the tarball simply does not exist (HTTP 404 / not found), the download
 			// failure is permanent and not retryable, so we let deletion proceed.
@@ -301,6 +298,12 @@ func (r *backupDeletionReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 				return ctrl.Result{}, err2
 			}
 		}
+	}
+
+	// VGS/VGSC resources are not stored in the Backup tarball, so clean them
+	// independently of whether DeleteItemActions used the tarball.
+	if err := csi.CleanupBackupVolumeGroupSnapshots(ctx, backup, r.Client, log); err != nil {
+		log.WithError(err).Warn("Could not clean up VolumeGroupSnapshots")
 	}
 
 	if backupStore != nil {
