@@ -608,7 +608,11 @@ func CleanupVolumeSnapshot(
 		vs,
 	)
 	if err != nil {
-		log.Debugf("Failed to get volumesnapshot %s/%s", volSnap.Namespace, volSnap.Name)
+		if apierrors.IsNotFound(err) {
+			log.Debugf("VolumeSnapshot %s/%s is already deleted", volSnap.Namespace, volSnap.Name)
+		} else {
+			log.WithError(err).Warnf("Failed to get volumesnapshot %s/%s; skipping cleanup", volSnap.Namespace, volSnap.Name)
+		}
 		return
 	}
 	if vs.Status != nil && vs.Status.VolumeGroupSnapshotName != nil {
@@ -645,6 +649,18 @@ func DeleteReadyVolumeSnapshot(
 	client crclient.Client,
 	logger logrus.FieldLogger,
 ) {
+	current := new(snapshotv1api.VolumeSnapshot)
+	if err := client.Get(ctx, crclient.ObjectKeyFromObject(&vs), current); err != nil {
+		if !apierrors.IsNotFound(err) {
+			logger.WithError(err).Warnf("Failed to get VolumeSnapshot %s/%s; skipping cleanup", vs.Namespace, vs.Name)
+		}
+		return
+	}
+	vs = *current
+	if vs.Status != nil && vs.Status.VolumeGroupSnapshotName != nil {
+		logger.Warnf("Deferring deletion of VGS member VolumeSnapshot %s/%s until VGS cleanup", vs.Namespace, vs.Name)
+		return
+	}
 	logger.Infof("Deleting Volumesnapshot %s/%s", vs.Namespace, vs.Name)
 	if vs.Status == nil ||
 		vs.Status.BoundVolumeSnapshotContentName == nil ||

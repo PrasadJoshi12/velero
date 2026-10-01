@@ -1661,7 +1661,18 @@ func TestDeleteVolumeSnapshots(t *testing.T) {
 				Status(&snapshotv1api.VolumeSnapshotContentStatus{}).Result(),
 			keepVSAndVSC: true,
 		},
+		{
+			name: "VGS member is deferred until group cleanup",
+			vs: *builder.ForVolumeSnapshot("velero", "vs1").
+				Status().BoundVolumeSnapshotContentName("vsc1").
+				Result(),
+			vsc: *builder.ForVolumeSnapshotContent("vsc1").
+				DeletionPolicy(snapshotv1api.VolumeSnapshotContentDelete).
+				Status(&snapshotv1api.VolumeSnapshotContentStatus{}).Result(),
+			keepVSAndVSC: true,
+		},
 	}
+	tests[2].vs.Status.VolumeGroupSnapshotName = ptr.To("group")
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
