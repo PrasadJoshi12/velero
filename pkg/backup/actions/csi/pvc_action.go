@@ -995,12 +995,14 @@ func (p *pvcBackupItemAction) createVolumeGroupSnapshot(
 	if err := p.crClient.Get(ctx, crclient.ObjectKeyFromObject(backup), currentBackup); err != nil {
 		return nil, errors.Wrap(err, "failed to mark Backup for VolumeGroupSnapshot cleanup")
 	}
-	updatedBackup := currentBackup.DeepCopy()
-	kubeutil.AddAnnotations(&updatedBackup.ObjectMeta, map[string]string{
-		velerov1api.VolumeGroupSnapshotBackupAnnotation: "true",
-	})
-	if err := p.crClient.Patch(ctx, updatedBackup, crclient.MergeFrom(currentBackup)); err != nil {
-		return nil, errors.Wrap(err, "failed to mark Backup for VolumeGroupSnapshot cleanup")
+	if currentBackup.Annotations[velerov1api.VolumeGroupSnapshotBackupAnnotation] != "true" {
+		updatedBackup := currentBackup.DeepCopy()
+		kubeutil.AddAnnotations(&updatedBackup.ObjectMeta, map[string]string{
+			velerov1api.VolumeGroupSnapshotBackupAnnotation: "true",
+		})
+		if err := p.crClient.Patch(ctx, updatedBackup, crclient.MergeFrom(currentBackup)); err != nil {
+			return nil, errors.Wrap(err, "failed to mark Backup for VolumeGroupSnapshot cleanup")
+		}
 	}
 	vgsLabels := map[string]string{
 		velerov1api.BackupNameLabel: label.GetValidName(backup.Name),
