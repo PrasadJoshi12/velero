@@ -95,6 +95,15 @@ func TestReconcileOfSchedule(t *testing.T) {
 			expectedValidationErrors: []string{`invalid spec.schedule "a 0 * * *": could not parse "a" as a valid cron field value. Expected a non-empty 5-field cron expression (minute hour day-of-month month day-of-week), e.g. "0 2 * * *" or "0 2 * * MON-FRI", or a supported shortcut, e.g. "@daily" or "@every 5m"`},
 		},
 		{
+			name: "invalid schedule update persists the new validation error",
+			schedule: newScheduleBuilder(velerov1.SchedulePhaseFailedValidation).
+				CronSchedule("b 0 * * *").
+				ValidationError(`invalid spec.schedule "a 0 * * *": could not parse "a" as a valid cron field value. Expected a non-empty 5-field cron expression (minute hour day-of-month month day-of-week), e.g. "0 2 * * *" or "0 2 * * MON-FRI", or a supported shortcut, e.g. "@daily" or "@every 5m"`).
+				SkipImmediately(ptr.To(false)).Result(),
+			expectedPhase:            string(velerov1.SchedulePhaseFailedValidation),
+			expectedValidationErrors: []string{`invalid spec.schedule "b 0 * * *": could not parse "b" as a valid cron field value. Expected a non-empty 5-field cron expression (minute hour day-of-month month day-of-week), e.g. "0 2 * * *" or "0 2 * * MON-FRI", or a supported shortcut, e.g. "@daily" or "@every 5m"`},
+		},
+		{
 			name:                 "schedule with phase New gets validated and triggers a backup",
 			schedule:             newScheduleBuilder(velerov1.SchedulePhaseNew).CronSchedule("@every 5m").Result(),
 			fakeClockTime:        "2017-01-01 12:00:00",

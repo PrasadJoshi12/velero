@@ -19,6 +19,7 @@ package controller
 import (
 	"context"
 	"fmt"
+	"reflect"
 	"strconv"
 	"time"
 
@@ -150,6 +151,10 @@ func (c *scheduleReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 	if currentPhase != schedule.Status.Phase {
 		scheduleNeedsPatch = true
 		errStringArr = append(errStringArr, fmt.Sprintf("phase to %s", schedule.Status.Phase))
+	}
+	if !reflect.DeepEqual(original.Status.ValidationErrors, schedule.Status.ValidationErrors) {
+		scheduleNeedsPatch = true
+		errStringArr = append(errStringArr, fmt.Sprintf("validation errors to %v", schedule.Status.ValidationErrors))
 	}
 	// update spec.SkipImmediately if it's changed
 	if !ptr.Equal(original.Spec.SkipImmediately, schedule.Spec.SkipImmediately) {
